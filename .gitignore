@@ -1,0 +1,18 @@
+# Local source checkouts pulled by build.sh
+src/
+kernel
+u-boot
+rkbin
+
+# Build artifacts
+out/
+output/
+prebuilt_rootfs/*.img
+*.img
+*.itb
+*.bin
+*.o
+*.dtb
+
+# Logs
+*.log
