@@ -480,7 +480,8 @@ static void btseekwave_port_close(struct btseekwave_data *data)
         }
         else
         {
-            SKWBT_ERROR("func %s service_stop not exist", __func__);
+            SKWBT_INFO("func %s service_stop not exist, fallback to legacy\n", __func__);
+            skw_stop_bt_service();
         }
 #else
         skw_stop_bt_service();
@@ -718,16 +719,16 @@ static int btseekwave_open(struct hci_dev *hdev)
         if(data->pdata->service_start)
         {
             err = data->pdata->service_start();
-            if(err != 0)
-            {
-                SKWBT_ERROR("func %s service_start err:%d", __func__, err);
-                return err;
-            }
         }
         else
         {
-            SKWBT_ERROR("func %s service_start not exist", __func__);
-            return -1;
+            SKWBT_INFO("func %s service_start not exist, fallback to legacy\n", __func__);
+            err = skw_start_bt_service();
+        }
+        if(err != 0)
+        {
+            SKWBT_ERROR("func %s service_start err:%d", __func__, err);
+            return err;
         }
 #else
         err = skw_start_bt_service();
@@ -921,7 +922,8 @@ int btseekwave_plt_event_notifier(struct notifier_block *nb, unsigned long actio
             }
             else
             {
-                SKWBT_ERROR("func %s service_stop not exist", __func__);
+                SKWBT_INFO("func %s service_stop not exist, fallback to legacy\n", __func__);
+                skw_stop_bt_service();
             }
 #else
             skw_stop_bt_service();
@@ -1169,4 +1171,3 @@ module_exit(btseekwave_exit);
 MODULE_DESCRIPTION("Seekwave Bluetooth driver ver " VERSION);
 MODULE_VERSION(VERSION);
 MODULE_LICENSE("GPL");
-

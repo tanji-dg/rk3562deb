@@ -177,6 +177,28 @@ build_kernel() {
         scripts/config --enable SKW_VENDOR || true
         scripts/config --enable SKW_DFS_MASTER || true
         scripts/config --module SKW_BT || true
+        # Enable Rockchip sensor framework before selecting accel drivers.
+        scripts/config --enable SENSOR_DEVICE || true
+        scripts/config --enable GSENSOR_DEVICE || true
+        scripts/config --enable SKW_LOG_WARN || true
+        scripts/config --disable SKW_LOG_DEBUG || true
+        scripts/config --disable SKW_LOG_DETAIL || true
+        # Build Android-matching accelerometer drivers (SC7A20/DA223).
+        scripts/config --enable GS_SC7A20 || true
+        scripts/config --enable GS_DA223 || true
+        scripts/config --enable GS_DA228E || true
+        # Keep Rockchip ASoC options aligned with known-good newrk3562 audio.
+        scripts/config --enable SND_CTL_FAST_LOOKUP || true
+        scripts/config --enable SND_SOC_ROCKCHIP_ASRC || true
+        scripts/config --enable SND_SOC_ROCKCHIP_DLP || true
+        scripts/config --enable SND_SOC_ROCKCHIP_DLP_PCM || true
+        scripts/config --enable SND_SOC_ROCKCHIP_MULTI_DAIS || true
+        scripts/config --enable SND_SOC_ROCKCHIP_PDM_V2 || true
+        scripts/config --enable SND_SOC_ROCKCHIP_TRCM || true
+        # Avoid black screen before userspace by enabling early fb console/logo.
+        scripts/config --enable FRAMEBUFFER_CONSOLE || true
+        scripts/config --enable LOGO || true
+        scripts/config --enable LOGO_LINUX_CLUT224 || true
         scripts/config --set-str EXTRA_FIRMWARE "RAM_RW_KERNEL_DRAM.bin ROM_EXEC_KERNEL_IRAM.bin EA6621Q_SEEKWAVE_R00005.bin" || true
         scripts/config --set-str EXTRA_FIRMWARE_DIR "firmware" || true
 
@@ -277,6 +299,15 @@ create_image() {
     echo "[+] Firefly-compatible image path: ${OUTPUT_DIR}/update/update.img"
 }
 
+create_update_package() {
+    echo "[*] Building offline update package..."
+    local updater="${ROOT_DIR}/tools/make_update_tar.sh"
+    if [ ! -x "${updater}" ]; then
+        chmod +x "${updater}"
+    fi
+    "${updater}" "${OUTPUT_DIR}/update/update.tar.gz"
+}
+
 CMD="${1:-all}"
 
 case "${CMD}" in
@@ -301,6 +332,9 @@ case "${CMD}" in
     updateimg)
         create_image
         ;;
+    updatepkg)
+        create_update_package
+        ;;
     compile)
         check_deps
         setup_dirs
@@ -320,9 +354,10 @@ case "${CMD}" in
         build_kernel
         sudo bash "${ROOT_DIR}/build_rootfs.sh"
         create_image
+        create_update_package
         ;;
     *)
-        echo "Usage: $0 {check|lunch|uboot|extboot|updateimg|compile|rootfs|image|all}"
+        echo "Usage: $0 {check|lunch|uboot|extboot|updateimg|updatepkg|compile|rootfs|image|all}"
         exit 1
         ;;
 esac

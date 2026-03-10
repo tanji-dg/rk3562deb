@@ -127,7 +127,7 @@ config SKW_RX_REORDER_TIMEOUT
 
 choice
 	prompt "Seekwave Log Level"
-	default SKW_LOG_DEBUG
+	default SKW_LOG_WARN
 	help
 	SEEKWAVE Log Level
 
