@@ -1,0 +1,27 @@
+# Local editor/OS
+.DS_Store
+*.swp
+*.swo
+
+# Build outputs
+out/
+output/
+prebuilt_rootfs/
+
+# Local logs
+*.log
+uart.log
+
+# Downloaded/upstream source trees (re-cloned by build scripts)
+src/
+kernel
+u-boot
+rkbin
+
+# Optional binary blobs/packages not required for a clean build pipeline
+debs/
+mali/
+wifi/
+
+# Local SDK selection cache
+.rk_lunch

@@ -1,0 +1,44 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Copyright (c) 2022 Rockchip Electronics Co., Ltd.
+ *
+ */
+
+#include "rk3562-evb1-lp4x-v10.dtsi"
+#include "rk3562-android.dtsi"
+#include "rk3562-rk817.dtsi"
+
+&rk817 {
+battery {
+compatible = "rk817,battery";
+ocv_table = <3400 3671 3686 3712 3738 3756 3773
+     3787 3802 3819 3840 3868 3916 3959
+     3998 4041 4087 4138 4191 4247 4313>;
+design_capacity = <5780>;
+design_qmax = <6358>;
+bat_res = <100>;
+sleep_enter_current = <150>;
+sleep_exit_current = <180>;
+sleep_filter_current = <100>;
+power_off_thresd = <3400>;
+zero_algorithm_vol = <3950>;
+max_soc_offset = <60>;
+monitor_sec = <5>;
+sample_res = <10>;
+virtual_power = <0>;
+};
+
+charger {
+compatible = "rk817,charger";
+min_input_voltage = <4500>;
+max_input_current = <1500>;
+max_chrg_current = <2000>;
+max_chrg_voltage = <4350>;
+chrg_term_mode = <0>;
+chrg_finish_cur = <300>;
+virtual_power = <0>;
+dc_det_adc = <0>;
+extcon = <&u2phy>;
+gate_function_disable = <1>;
+};
+};

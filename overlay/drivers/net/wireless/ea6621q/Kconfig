@@ -1,0 +1,72 @@
+# SPDX-License-Identifier: GPL-2.0
+# Seekwave EA6621Q WiFi driver Kconfig
+
+config SEEKWAVE_BSP_DRIVERS
+	tristate "Seekwave Platform BSP Drivers"
+	depends on MMC
+	help
+	  Platform/HAL layer for Seekwave chips (SDIO bus, boot utility).
+
+if SEEKWAVE_BSP_DRIVERS
+
+config SKW_SDIOHAL
+	tristate "Seekwave Platform SDIO Driver"
+	depends on SEEKWAVE_BSP_DRIVERS
+	help
+	  SDIO bus HAL for Seekwave chip.
+
+config SKW_BSP_UCOM
+	tristate "Seekwave Boot Utility"
+	depends on SEEKWAVE_BSP_DRIVERS
+	help
+	  Boot/utility helper for Seekwave chip.
+
+config SKW_BSP_BOOT
+	bool "Seekwave platform boot support"
+	depends on SEEKWAVE_BSP_DRIVERS
+
+endif # SEEKWAVE_BSP_DRIVERS
+
+config WLAN_VENDOR_SEEKWAVE
+	tristate "Seekwave EA6621Q 802.11ax WiFi"
+	depends on CFG80211 && SEEKWAVE_BSP_DRIVERS
+	help
+	  WiFi driver for Seekwave EA6621Q / SWT6621S chip.
+
+if WLAN_VENDOR_SEEKWAVE
+
+config SKW_VENDOR
+	bool
+	default y
+
+config SKW_DFS_MASTER
+	bool
+	default y
+
+config SKW_TX_WORKQUEUE
+	bool
+	default y
+
+config SKW_HIGH_PRIORITY
+	bool
+	default y
+
+config SKW_REGD_SELF_MANAGED
+	bool
+	default y
+
+config SKW_STA_SME_EXT
+	bool
+	default y
+
+config SKW_SAP_SME_EXT
+	bool
+	default y
+
+config SKW_SCAN_RANDOM_MAC
+	bool
+	default y
+
+endif # WLAN_VENDOR_SEEKWAVE
+
+source "drivers/net/wireless/ea6621q/swtbt4l/Kconfig"
