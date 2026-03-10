@@ -19,7 +19,6 @@ u-boot
 rkbin
 
 # Optional binary blobs/packages not required for a clean build pipeline
-debs/
 mali/
 
 # Local SDK selection cache
