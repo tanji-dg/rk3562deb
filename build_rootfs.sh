@@ -570,13 +570,51 @@ repair_panel_if_needed() {
     sleep 3
 }
 
+wait_for_system_bluez() {
+    for _ in $(seq 1 30); do
+        if dbus-send --system --dest=org.freedesktop.DBus --type=method_call \
+          /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner string:org.bluez \
+          2>/dev/null | grep -q "boolean true"; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+controller_ready() {
+    bluetoothctl list 2>/dev/null | grep -q '^Controller '
+}
+
+prepare_bluetooth() {
+    if command -v rfkill >/dev/null 2>&1; then
+        rfkill unblock all >/dev/null 2>&1 || true
+    fi
+    if command -v bluetoothctl >/dev/null 2>&1; then
+        wait_for_system_bluez || true
+        for _ in $(seq 1 15); do
+            controller_ready && break
+            sleep 1
+        done
+        printf 'power on\nquit\n' | bluetoothctl >/dev/null 2>&1 || true
+    fi
+}
+
 ensure_panel
 repair_panel_if_needed
+prepare_bluetooth
 
-# Always restart to re-register the tray icon after panel/tray recovery.
+# Kill duplicates from package autostart entries, then keep retrying in case
+# the applet exits before the controller is ready.
 pkill -x blueman-applet >/dev/null 2>&1 || true
 sleep 1
-exec blueman-applet
+while :; do
+    if blueman-applet >/dev/null 2>&1; then
+        :
+    fi
+    sleep 3
+    prepare_bluetooth
+done
 RK_BLUEMAN_START
 chmod +x "${ROOTFS_MNT}/usr/local/bin/rk-blueman-applet-start.sh"
 
@@ -689,7 +727,11 @@ controller_ready() {
     bluetoothctl list 2>/dev/null | grep -q '^Controller '
 }
 
-[ -e "${READY_FILE}" ] && exit 0
+# If a previous pass marked ready but controller is gone, retry recovery.
+if [ -e "${READY_FILE}" ] && controller_ready; then
+    exit 0
+fi
+rm -f "${READY_FILE}" 2>/dev/null || true
 
 if command -v rfkill >/dev/null 2>&1; then
     rfkill unblock all || true
@@ -708,23 +750,8 @@ for _ in $(seq 1 20); do
     sleep 1
 done
 
-if command -v modprobe >/dev/null 2>&1; then
-    modprobe -r skwbt >/dev/null 2>&1 || true
-    sleep 1
-    modprobe skwbt >/dev/null 2>&1 || true
-fi
-
-systemctl restart bluetooth.service >/dev/null 2>&1 || true
-
-for _ in $(seq 1 20); do
-    if controller_ready; then
-        printf 'power on\nquit\n' | bluetoothctl >/dev/null 2>&1 || true
-        touch "${READY_FILE}"
-        exit 0
-    fi
-    sleep 1
-done
-
+# Keep boot behavior stable: avoid force-unloading/restarting BT from a
+# background helper because that can make the controller disappear mid-boot.
 exit 0
 RK_BT_RECOVER
 chmod +x "${ROOTFS_MNT}/usr/local/sbin/rk-bluetooth-recover.sh"
@@ -743,17 +770,13 @@ ExecStart=/usr/local/sbin/rk-bluetooth-recover.sh
 WantedBy=multi-user.target
 RK_BT_RECOVER_UNIT
 
-mkdir -p "${ROOTFS_MNT}/etc/systemd/system/multi-user.target.wants"
-ln -sf /etc/systemd/system/rk-bluetooth-recover.service \
-    "${ROOTFS_MNT}/etc/systemd/system/multi-user.target.wants/rk-bluetooth-recover.service"
-
 cat > "${ROOTFS_MNT}/etc/systemd/system/rk-bluetooth-recover.timer" << 'RK_BT_RECOVER_TIMER'
 [Unit]
 Description=Retry Seekwave Bluetooth recovery until controller appears
 
 [Timer]
-OnBootSec=15s
-OnUnitActiveSec=25s
+OnBootSec=90s
+OnUnitActiveSec=5min
 AccuracySec=1s
 Unit=rk-bluetooth-recover.service
 
@@ -761,9 +784,13 @@ Unit=rk-bluetooth-recover.service
 WantedBy=timers.target
 RK_BT_RECOVER_TIMER
 
+# Do not auto-enable recovery service/timer by default. They can still be
+# started manually for debugging:
+#   systemctl start rk-bluetooth-recover.service
+mkdir -p "${ROOTFS_MNT}/etc/systemd/system/multi-user.target.wants"
 mkdir -p "${ROOTFS_MNT}/etc/systemd/system/timers.target.wants"
-ln -sf /etc/systemd/system/rk-bluetooth-recover.timer \
-    "${ROOTFS_MNT}/etc/systemd/system/timers.target.wants/rk-bluetooth-recover.timer"
+rm -f "${ROOTFS_MNT}/etc/systemd/system/multi-user.target.wants/rk-bluetooth-recover.service"
+rm -f "${ROOTFS_MNT}/etc/systemd/system/timers.target.wants/rk-bluetooth-recover.timer"
 
 # Harden bluetooth.service startup ordering for Seekwave BT.
 echo "[*] Installing Bluetooth service override..."
