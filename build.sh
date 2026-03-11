@@ -136,6 +136,7 @@ build_kernel() {
         if [ -d .git ]; then
             local incompatible_overlay_files=(
                 "drivers/mfd/rk808.c"
+                "drivers/power/supply/rk817_charger.c"
                 "drivers/phy/rockchip/phy-rockchip-inno-usb2.c"
             )
 

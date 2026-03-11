@@ -770,16 +770,23 @@ echo "[*] Installing Bluetooth service override..."
 mkdir -p "${ROOTFS_MNT}/etc/systemd/system/bluetooth.service.d"
 cat > "${ROOTFS_MNT}/etc/systemd/system/bluetooth.service.d/rk-skwbt.conf" << 'RK_BT_OVERRIDE'
 [Unit]
+# Drop Debian's default ConditionPathIsDirectory=/sys/class/bluetooth so
+# bluetoothd can start and request module bring-up on first boot.
+ConditionPathIsDirectory=
 After=systemd-modules-load.service rk-unblock-rfkill.service
 Wants=rk-unblock-rfkill.service
 
 [Service]
-ExecStartPre=/usr/sbin/modprobe skwbt
-ExecStartPre=/usr/sbin/rfkill unblock all
+ExecStartPre=/bin/sh -c '/usr/sbin/modprobe skwbt >/dev/null 2>&1 || true; for i in $(seq 1 20); do [ -d /sys/class/bluetooth ] && exit 0; sleep 1; done; exit 0'
+ExecStartPre=/bin/sh -c '/usr/sbin/rfkill unblock all >/dev/null 2>&1 || true'
 ExecStartPost=/bin/sh -c 'printf "power on\nquit\n" | /usr/bin/bluetoothctl >/dev/null 2>&1 || true'
 Restart=on-failure
 RestartSec=2
 RK_BT_OVERRIDE
+
+mkdir -p "${ROOTFS_MNT}/etc/systemd/system/multi-user.target.wants"
+ln -sf /lib/systemd/system/bluetooth.service \
+    "${ROOTFS_MNT}/etc/systemd/system/multi-user.target.wants/bluetooth.service"
 
 # Auto-rotate display/touchscreen based on accelerometer readings.
 echo "[*] Installing accelerometer auto-rotate service..."
