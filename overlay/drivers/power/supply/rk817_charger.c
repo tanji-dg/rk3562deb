@@ -303,6 +303,7 @@ struct rk817_charger {
 	struct delayed_work usb_work;
 	struct delayed_work host_work;
 	struct delayed_work discnt_work;
+	struct delayed_work redet_work;
 	struct delayed_work irq_work;
 	struct notifier_block bc_nb;
 	struct notifier_block cable_cg_nb;
@@ -331,9 +332,13 @@ struct rk817_charger {
 	u8 otg_slp_state;
 	u8 plugin_trigger;
 	u8 plugout_trigger;
+	u8 redet_retry;
 	int plugin_irq;
 	int plugout_irq;
 };
+
+#define RK817_EXTCON_RECHECK_MS		500
+#define RK817_EXTCON_RECHECK_MAX	20
 
 static enum power_supply_property rk817_ac_props[] = {
 	POWER_SUPPLY_PROP_ONLINE,
@@ -1041,6 +1046,7 @@ static void rk817_charger_evt_worker(struct work_struct *work)
 	enum charger_t charger = USB_TYPE_UNKNOWN_CHARGER;
 	static const char * const event[] = {"UN", "NONE", "USB",
 					     "AC", "CDP1.5A"};
+	bool vbus_present;
 
 	/* Determine cable/charger type */
 	if (extcon_get_state(edev, EXTCON_CHG_USB_SDP) > 0)
@@ -1054,20 +1060,69 @@ static void rk817_charger_evt_worker(struct work_struct *work)
 		DBG("receive type-c notifier event: %s...\n",
 		    event[charger]);
 		charge->usb_charger = charger;
+		charge->redet_retry = 0;
 		rk817_charge_set_chrg_param(charge, charger);
+		return;
 	}
+
+	/*
+	 * BC1.2 classification can lag behind plug-in/boot transitions.
+	 * Re-check for a while before falling back to a conservative limit.
+	 */
+	vbus_present = rk817_charge_get_plug_in_status(charge) > 0;
+	if (vbus_present) {
+		if (charge->redet_retry < RK817_EXTCON_RECHECK_MAX) {
+			charge->redet_retry++;
+			queue_delayed_work(charge->usb_charger_wq,
+					   &charge->redet_work,
+					   msecs_to_jiffies(RK817_EXTCON_RECHECK_MS));
+		} else {
+			/*
+			 * Keep charging robust when DCP detection never arrives
+			 * while VBUS is physically present.
+			 */
+			DBG("type-c charger type unknown too long, fallback to AC\n");
+			charge->redet_retry = 0;
+			charge->usb_charger = USB_TYPE_AC_CHARGER;
+			rk817_charge_set_chrg_param(charge, USB_TYPE_AC_CHARGER);
+		}
+	} else {
+		charge->redet_retry = 0;
+	}
+}
+
+static void rk817_charge_redet_worker(struct work_struct *work)
+{
+	struct rk817_charger *charge = container_of(work,
+			struct rk817_charger, redet_work.work);
+
+	queue_delayed_work(charge->usb_charger_wq, &charge->usb_work, 0);
 }
 
 static void rk817_charge_discnt_evt_worker(struct work_struct *work)
 {
 	struct rk817_charger *charge = container_of(work,
 			struct rk817_charger, discnt_work.work);
+	bool vbus_present;
 
-	if (extcon_get_state(charge->cable_edev, EXTCON_USB) == 0) {
-		DBG("receive type-c notifier event: DISCNT...\n");
+	if (extcon_get_state(charge->cable_edev, EXTCON_USB) != 0)
+		return;
 
+	DBG("receive type-c notifier event: DISCNT...\n");
+	vbus_present = rk817_charge_get_plug_in_status(charge) > 0;
+	if (!vbus_present) {
 		rk817_charge_set_chrg_param(charge, USB_TYPE_NONE_CHARGER);
+		return;
 	}
+
+	/*
+	 * Keep charger current profile until BC1.2/type-C settles, then
+	 * re-evaluate instead of forcing low-current immediately.
+	 */
+	queue_delayed_work(charge->usb_charger_wq, &charge->usb_work,
+			   msecs_to_jiffies(20));
+	queue_delayed_work(charge->usb_charger_wq, &charge->redet_work,
+			   msecs_to_jiffies(RK817_EXTCON_RECHECK_MS));
 }
 
 static void rk817_charge_bc_evt_worker(struct work_struct *work)
@@ -1481,9 +1536,23 @@ static void rk817_charge_irq_delay_work(struct work_struct *work)
 	} else if (charge->plugout_trigger) {
 		DBG("pmic: plug out\n");
 		charge->plugout_trigger = 0;
-		rk817_charge_set_chrg_param(charge, USB_TYPE_NONE_CHARGER);
-		rk817_charge_set_chrg_param(charge, DC_TYPE_NONE_CHARGER);
-		if (!charge->pdata->extcon) {
+		if (charge->pdata->extcon) {
+			/*
+			 * With extcon, plug-out IRQ can be transient during
+			 * role/BC1.2 updates. Re-evaluate instead of forcing
+			 * low-current profile immediately.
+			 */
+			if (!rk817_charge_get_plug_in_status(charge)) {
+				charge->redet_retry = 0;
+				rk817_charge_set_chrg_param(charge, USB_TYPE_NONE_CHARGER);
+			}
+			queue_delayed_work(charge->usb_charger_wq, &charge->usb_work,
+					   msecs_to_jiffies(20));
+			queue_delayed_work(charge->usb_charger_wq, &charge->redet_work,
+					   msecs_to_jiffies(RK817_EXTCON_RECHECK_MS));
+		} else {
+			rk817_charge_set_chrg_param(charge, USB_TYPE_NONE_CHARGER);
+			rk817_charge_set_chrg_param(charge, DC_TYPE_NONE_CHARGER);
 			/* Re-enable OTG for USB host */
 			rk817_charge_otg_enable(charge);
 			rk817_charge_field_write(charge, OTG_EN,
@@ -1559,6 +1628,7 @@ static int rk817_charge_init_irqs(struct rk817_charger *charge)
 	charge->plugout_irq = plug_out_irq;
 
 	INIT_DELAYED_WORK(&charge->irq_work, rk817_charge_irq_delay_work);
+	INIT_DELAYED_WORK(&charge->redet_work, rk817_charge_redet_worker);
 
 	return 0;
 }
@@ -1646,8 +1716,11 @@ static int rk817_charge_probe(struct platform_device *pdev)
 	}
 
 	if (charge->pdata->extcon) {
-		schedule_delayed_work(&charge->host_work, 0);
-		schedule_delayed_work(&charge->usb_work, 0);
+		queue_delayed_work(charge->usb_charger_wq, &charge->host_work, 0);
+		queue_delayed_work(charge->usb_charger_wq, &charge->usb_work,
+				   msecs_to_jiffies(100));
+		queue_delayed_work(charge->usb_charger_wq, &charge->redet_work,
+				   msecs_to_jiffies(RK817_EXTCON_RECHECK_MS));
 	}
 
 	rk817_chage_debug(charge);
@@ -1658,6 +1731,7 @@ irq_fail:
 	if (charge->pdata->extcon) {
 		cancel_delayed_work_sync(&charge->host_work);
 		cancel_delayed_work_sync(&charge->discnt_work);
+		cancel_delayed_work_sync(&charge->redet_work);
 	}
 
 	cancel_delayed_work_sync(&charge->usb_work);
@@ -1737,6 +1811,7 @@ static void rk817_charger_shutdown(struct platform_device *dev)
 	if (charge->pdata->extcon) {
 		cancel_delayed_work_sync(&charge->host_work);
 		cancel_delayed_work_sync(&charge->discnt_work);
+		cancel_delayed_work_sync(&charge->redet_work);
 	}
 
 	rk817_charge_set_otg_state(charge, USB_OTG_POWER_OFF);
