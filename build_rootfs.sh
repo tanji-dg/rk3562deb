@@ -202,6 +202,14 @@ if [ -e "${ROOTFS_MNT}/usr/bin/su" ]; then
     chroot "${ROOTFS_MNT}" chown root:root /usr/bin/su || true
     chroot "${ROOTFS_MNT}" chmod 4755 /usr/bin/su || true
 fi
+for helper in /usr/sbin/xfpm-power-backlight-helper \
+              /usr/libexec/xfpm-power-backlight-helper \
+              /usr/lib/xfce4/xfpm-power-backlight-helper; do
+    if [ -e "${ROOTFS_MNT}${helper}" ]; then
+        chroot "${ROOTFS_MNT}" chown root:root "${helper}" || true
+        chroot "${ROOTFS_MNT}" chmod 4755 "${helper}" || true
+    fi
+done
 # 4. Install Kernel Modules
 if [ -d "${MODULES_DIR}" ]; then
     echo "[*] Installing kernel modules..."
@@ -299,12 +307,48 @@ KERNEL=="vdpu*", GROUP="video", MODE="0660"
 UDEV_MPP
 
 echo "[*] Adding backlight permission rule..."
+mkdir -p "${ROOTFS_MNT}/usr/local/sbin"
+cat > "${ROOTFS_MNT}/usr/local/sbin/rk-backlight-setup.sh" << 'RK_BACKLIGHT_SETUP'
+#!/bin/sh
+set -eu
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+for backlight in /sys/class/backlight/*; do
+    [ -d "${backlight}" ] || continue
+    for attr in brightness bl_power; do
+        file="${backlight}/${attr}"
+        [ -e "${file}" ] || continue
+        chgrp video "${file}" 2>/dev/null || true
+        chmod g+w "${file}" 2>/dev/null || true
+    done
+done
+
+exit 0
+RK_BACKLIGHT_SETUP
+chmod +x "${ROOTFS_MNT}/usr/local/sbin/rk-backlight-setup.sh"
+
 tee "${ROOTFS_MNT}/etc/udev/rules.d/90-backlight-permissions.rules" > /dev/null << 'UDEV_BACKLIGHT'
-ACTION=="add", SUBSYSTEM=="backlight", RUN+="/bin/chgrp video /sys/class/backlight/%k/brightness"
-ACTION=="add", SUBSYSTEM=="backlight", RUN+="/bin/chmod g+w /sys/class/backlight/%k/brightness"
-ACTION=="add", SUBSYSTEM=="backlight", RUN+="/bin/chgrp video /sys/class/backlight/%k/bl_power"
-ACTION=="add", SUBSYSTEM=="backlight", RUN+="/bin/chmod g+w /sys/class/backlight/%k/bl_power"
+ACTION=="add|change", SUBSYSTEM=="backlight", RUN+="/usr/local/sbin/rk-backlight-setup.sh"
 UDEV_BACKLIGHT
+
+cat > "${ROOTFS_MNT}/etc/systemd/system/rk-backlight-setup.service" << 'RK_BACKLIGHT_UNIT'
+[Unit]
+Description=Fix backlight permissions for desktop control
+After=systemd-udev-settle.service local-fs.target
+Wants=systemd-udev-settle.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/rk-backlight-setup.sh
+
+[Install]
+WantedBy=multi-user.target
+RK_BACKLIGHT_UNIT
+
+mkdir -p "${ROOTFS_MNT}/etc/systemd/system/multi-user.target.wants"
+ln -sf /etc/systemd/system/rk-backlight-setup.service \
+    "${ROOTFS_MNT}/etc/systemd/system/multi-user.target.wants/rk-backlight-setup.service"
 
 echo "[*] Adding touchscreen input rule..."
 tee "${ROOTFS_MNT}/etc/udev/rules.d/99-touchscreen-gsl3673.rules" > /dev/null << 'UDEV_TS'
@@ -665,8 +709,15 @@ echo "[*] Adding polkit rule for backlight control..."
 mkdir -p "${ROOTFS_MNT}/etc/polkit-1/rules.d"
 cat > "${ROOTFS_MNT}/etc/polkit-1/rules.d/49-backlight.rules" << 'BACKLIGHT_POLKIT'
 polkit.addRule(function(action, subject) {
-    if (action.id == "org.freedesktop.login1.set-backlight" &&
-        subject.isInGroup("video")) {
+    var backlightAction =
+        action.id == "org.freedesktop.login1.set-backlight" ||
+        action.id == "org.xfce.power.backlight-helper";
+
+    if (!backlightAction) {
+        return;
+    }
+
+    if (subject.active && subject.isInGroup("video")) {
         return polkit.Result.YES;
     }
 });
