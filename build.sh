@@ -140,8 +140,8 @@ build_kernel() {
             if [ "${RKDEBIAN_RESTORE_UPSTREAM_KERNEL_FILES:-0}" = "1" ]; then
                 local restore_overlay_files=(
                     "drivers/mfd/rk808.c"
+                    "drivers/power/supply/rk817_battery.c"
                     "drivers/power/supply/rk817_charger.c"
-                    "drivers/phy/rockchip/phy-rockchip-inno-usb2.c"
                 )
 
                 for file in "${restore_overlay_files[@]}"; do

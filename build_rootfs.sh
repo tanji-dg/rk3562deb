@@ -504,6 +504,7 @@ cat > "${ROOTFS_MNT}/home/chaos/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-p
     <property name="lid-action-on-ac" type="uint" value="0"/>
     <property name="lid-action-on-battery" type="uint" value="0"/>
     <property name="sleep-button-action" type="uint" value="0"/>
+    <property name="power-button-action" type="uint" value="0"/>
     <property name="critical-power-action" type="uint" value="0"/>
   </property>
 </channel>
@@ -730,11 +731,12 @@ ONBOARD
 chmod +x "${ROOTFS_MNT}/home/chaos/Desktop/on-screen-keyboard.desktop"
 chroot "${ROOTFS_MNT}" chown chaos:chaos /home/chaos/Desktop/on-screen-keyboard.desktop || true
 
-# logind.conf ignoring power key
+# Power key: short press = suspend, long press = poweroff
 mkdir -p "${ROOTFS_MNT}/etc/systemd/logind.conf.d"
 cat > "${ROOTFS_MNT}/etc/systemd/logind.conf.d/power-button.conf" << 'LOGIND'
 [Login]
-HandlePowerKey=ignore
+HandlePowerKey=suspend
+HandlePowerKeyLongPress=poweroff
 LOGIND
 
 echo "[*] Adding polkit rule for backlight control..."
@@ -1719,86 +1721,48 @@ if [ -f "${ROOT_DIR}/overlay/usb-mode-switch.sh" ] && [ -f "${ROOT_DIR}/overlay/
     chroot "${ROOTFS_MNT}" systemctl enable usb-otg-host.service
 fi
 
-# 10b. RK817 hard poweroff hook
-echo "[*] Installing RK817 hard poweroff hook..."
-mkdir -p "${ROOTFS_MNT}/usr/local/sbin"
-cat > "${ROOTFS_MNT}/usr/local/sbin/rk817-dev-off.py" << 'RK817_OFF'
-#!/usr/bin/env python3
-import fcntl
-import glob
-import os
-import re
+# 10b. (removed) rk817-hard-poweroff userspace service was removed.
+# The kernel's rk817_battery_shutdown() now saves dsoc/capacity before
+# pm_power_off_prepare runs, and rk817_shutdown_prepare() writes DEV_OFF
+# directly via i2c_smbus.  A userspace service running before systemd-poweroff
+# would kill the PMIC before the kernel can save battery state.
 
-I2C_SLAVE_FORCE = 0x0706
-RK817_ADDR = 0x20
-SYS_CFG3 = 0xF4
+# 10c. Power tuning service (WiFi power-save, CPU governor)
+echo "[*] Installing power tuning service..."
+cat > "${ROOTFS_MNT}/usr/local/sbin/rk-power-tune.sh" << 'RK_POWER_TUNE'
+#!/bin/sh
+# RK3562 tablet power tuning — runs once at boot after network is up.
 
+# Enable WiFi power save if interface exists
+for iface in wlan0 wlan1; do
+    if ip link show "$iface" > /dev/null 2>&1; then
+        iw dev "$iface" set power_save on 2>/dev/null || true
+    fi
+done
 
-def detect_i2c_bus():
-    # RK817 usually appears as *-0020. Resolve the matching /dev/i2c-* node.
-    for dev_path in sorted(glob.glob("/sys/bus/i2c/devices/*-0020")):
-        match = re.search(r"/([0-9]+)-0020$", dev_path)
-        if not match:
-            continue
-        bus = f"/dev/i2c-{match.group(1)}"
-        if os.path.exists(bus):
-            return bus
+# Switch all CPU policies to schedutil if currently set to performance
+for policy in /sys/devices/system/cpu/cpufreq/policy*; do
+    [ -f "$policy/scaling_governor" ] || continue
+    echo schedutil > "$policy/scaling_governor" 2>/dev/null || true
+done
+RK_POWER_TUNE
+chmod +x "${ROOTFS_MNT}/usr/local/sbin/rk-power-tune.sh"
 
-    fallback = "/dev/i2c-0"
-    if os.path.exists(fallback):
-        return fallback
-
-    return None
-
-
-def main() -> int:
-    i2c_bus = detect_i2c_bus()
-    if not i2c_bus:
-        return 0
-
-    try:
-        fd = os.open(i2c_bus, os.O_RDWR)
-    except OSError:
-        return 0
-
-    try:
-        fcntl.ioctl(fd, I2C_SLAVE_FORCE, RK817_ADDR)
-        os.write(fd, bytes([SYS_CFG3]))
-        raw = os.read(fd, 1)
-        if not raw:
-            return 1
-        value = raw[0] | 0x01
-        os.write(fd, bytes([SYS_CFG3, value]))
-        return 0
-    finally:
-        os.close(fd)
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-RK817_OFF
-chmod +x "${ROOTFS_MNT}/usr/local/sbin/rk817-dev-off.py"
-
-mkdir -p "${ROOTFS_MNT}/etc/systemd/system"
-cat > "${ROOTFS_MNT}/etc/systemd/system/rk817-hard-poweroff.service" << 'RK817_UNIT'
+cat > "${ROOTFS_MNT}/etc/systemd/system/rk-power-tune.service" << 'RK_POWER_TUNE_UNIT'
 [Unit]
-Description=Force RK817 DEV_OFF before poweroff
-DefaultDependencies=no
-Before=systemd-poweroff.service
-Conflicts=reboot.target halt.target kexec.target
+Description=RK3562 power tuning (WiFi power-save, CPU governor)
+After=network.target
+Wants=network.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 /usr/local/sbin/rk817-dev-off.py
-TimeoutSec=3
+ExecStart=/usr/local/sbin/rk-power-tune.sh
+RemainAfterExit=yes
 
 [Install]
-WantedBy=poweroff.target
-RK817_UNIT
-
-mkdir -p "${ROOTFS_MNT}/etc/systemd/system/poweroff.target.wants"
-ln -sf /etc/systemd/system/rk817-hard-poweroff.service \
-    "${ROOTFS_MNT}/etc/systemd/system/poweroff.target.wants/rk817-hard-poweroff.service"
+WantedBy=multi-user.target
+RK_POWER_TUNE_UNIT
+chroot "${ROOTFS_MNT}" systemctl enable rk-power-tune.service
 
 # 11. Offline update package auto-apply service
 echo "[*] Installing offline update auto-apply service..."
