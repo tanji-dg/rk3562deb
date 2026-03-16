@@ -287,7 +287,7 @@
 		height-mm = <216>;
 
 		bpc = <8>;
-		bus-format = <0x101c>; /* MEDIA_BUS_FMT_RGB888_3X8 */
+		bus-format = <0x100a>; /* MEDIA_BUS_FMT_RGB888_1X24 — avoids vop3_output_rb_swap which incorrectly applies DSP_RB_SWAP on RK3562 (VOP2 not VOP3) */
 
 		dsi,flags = <(MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_BURST |
 			      MIPI_DSI_MODE_EOT_PACKET |

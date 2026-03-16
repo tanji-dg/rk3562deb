@@ -1725,17 +1725,39 @@ mkdir -p "${ROOTFS_MNT}/usr/local/sbin"
 cat > "${ROOTFS_MNT}/usr/local/sbin/rk817-dev-off.py" << 'RK817_OFF'
 #!/usr/bin/env python3
 import fcntl
+import glob
 import os
+import re
 
 I2C_SLAVE_FORCE = 0x0706
-I2C_BUS = "/dev/i2c-0"
 RK817_ADDR = 0x20
 SYS_CFG3 = 0xF4
 
 
+def detect_i2c_bus():
+    # RK817 usually appears as *-0020. Resolve the matching /dev/i2c-* node.
+    for dev_path in sorted(glob.glob("/sys/bus/i2c/devices/*-0020")):
+        match = re.search(r"/([0-9]+)-0020$", dev_path)
+        if not match:
+            continue
+        bus = f"/dev/i2c-{match.group(1)}"
+        if os.path.exists(bus):
+            return bus
+
+    fallback = "/dev/i2c-0"
+    if os.path.exists(fallback):
+        return fallback
+
+    return None
+
+
 def main() -> int:
+    i2c_bus = detect_i2c_bus()
+    if not i2c_bus:
+        return 0
+
     try:
-        fd = os.open(I2C_BUS, os.O_RDWR)
+        fd = os.open(i2c_bus, os.O_RDWR)
     except OSError:
         return 0
 
@@ -1764,7 +1786,6 @@ Description=Force RK817 DEV_OFF before poweroff
 DefaultDependencies=no
 Before=systemd-poweroff.service
 Conflicts=reboot.target halt.target kexec.target
-ConditionPathExists=/dev/i2c-0
 
 [Service]
 Type=oneshot

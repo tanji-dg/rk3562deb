@@ -134,18 +134,25 @@ build_kernel() {
         cp -r "${ROOT_DIR}/overlay/." .
 
         if [ -d .git ]; then
-            local incompatible_overlay_files=(
-                "drivers/mfd/rk808.c"
-                "drivers/power/supply/rk817_charger.c"
-                "drivers/phy/rockchip/phy-rockchip-inno-usb2.c"
-            )
+            # Keep overlay kernel fixes by default.
+            # Set RKDEBIAN_RESTORE_UPSTREAM_KERNEL_FILES=1 to force restoring
+            # selected files from upstream when bisecting build issues.
+            if [ "${RKDEBIAN_RESTORE_UPSTREAM_KERNEL_FILES:-0}" = "1" ]; then
+                local restore_overlay_files=(
+                    "drivers/mfd/rk808.c"
+                    "drivers/power/supply/rk817_charger.c"
+                    "drivers/phy/rockchip/phy-rockchip-inno-usb2.c"
+                )
 
-            for file in "${incompatible_overlay_files[@]}"; do
-                if [ -f "${ROOT_DIR}/overlay/${file}" ]; then
-                    echo "[!] Overlay file ${file} is incompatible with current kernel tree; restoring upstream version."
-                    git checkout -- "${file}"
-                fi
-            done
+                for file in "${restore_overlay_files[@]}"; do
+                    if [ -f "${ROOT_DIR}/overlay/${file}" ]; then
+                        echo "[!] Restoring upstream kernel file for ${file} (RKDEBIAN_RESTORE_UPSTREAM_KERNEL_FILES=1)."
+                        git checkout -- "${file}"
+                    fi
+                done
+            else
+                echo "[*] Keeping overlay kernel files (set RKDEBIAN_RESTORE_UPSTREAM_KERNEL_FILES=1 to restore upstream versions)."
+            fi
         fi
     fi
 
