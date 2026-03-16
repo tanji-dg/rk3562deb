@@ -79,10 +79,41 @@ apt-get install -y sudo curl wget nano vim openssh-server network-manager wpasup
     libegl1 libgles2 libgbm1 ffmpeg dbus \
     udev evtest lightdm pciutils usbutils \
     xinput libinput-tools \
-    python3 \
+    python3 python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 \
     iproute2 iputils-ping dnsutils locales tzdata xfce4-power-manager upower brightnessctl rfkill \
     vainfo vdpauinfo \
     onboard wireless-regdb firmware-brcm80211
+
+# Remove any Trixie apt source that may be left over from a previous failed
+# build attempt.  Trixie packages require libc6 >= 2.38 which Bookworm does
+# not have, so mixing the two repos breaks apt.
+rm -f "${ROOTFS_MNT}/etc/apt/sources.list.d/trixie.list"
+rm -f "${ROOTFS_MNT}/etc/apt/preferences.d/99-trixie-pin"
+apt-get update -qq
+
+# Wayland compositor stack — all from Debian Bookworm (no external repos).
+# sway:     wlroots compositor, Wayland alternative to XFCE.
+# swaybg:   wallpaper setter.
+# wofi:     Wayland-native app launcher (replaces rofi/dmenu for touch).
+# jq:       JSON parsing used by the rotation tray app (swaymsg output).
+# Note: xwayland disabled — Mali glamor crashes under Xwayland same as X11.
+# foot: Wayland-native terminal — required because xwayland is disabled so
+# xfce4-terminal and other X11 terminals won't launch in this session.
+apt-get install -y sway swaybg wofi jq foot
+
+# Optional Wayland tools — install if available in Bookworm, skip otherwise.
+for optional_pkg in waybar grim slurp wlr-randr; do
+    # Check exact Bookworm version to avoid accidentally pulling Trixie builds
+    # that sneak in via a dirty apt cache.
+    pkg_ver=$(apt-cache policy "${optional_pkg}" 2>/dev/null \
+              | awk '/Candidate:/{print $2}')
+    if [ -n "${pkg_ver}" ] && [ "${pkg_ver}" != "(none)" ]; then
+        apt-get install -y "${optional_pkg}" || \
+            echo "[!] Warning: ${optional_pkg} install failed, skipping"
+    else
+        echo "[!] Warning: ${optional_pkg} not available, skipping"
+    fi
+done
 
 # Install one tray-indicator plugin if available on this Debian mirror.
 for optional_pkg in xfce4-statusnotifier-plugin xfce4-indicator-plugin; do
@@ -121,7 +152,7 @@ if ! id "chaos" &>/dev/null; then
     useradd -m -s /bin/bash chaos
     echo "chaos:chaos" | chpasswd
 fi
-usermod -aG sudo,video,audio,netdev,render chaos
+usermod -aG sudo,video,audio,netdev,render,input chaos
 
 # Set root password
 echo "root:root" | chpasswd
@@ -369,6 +400,11 @@ cat > "${ROOTFS_MNT}/etc/X11/xorg.conf.d/20-modesetting-rockchip.conf" << 'XORG_
 Section "Device"
     Identifier "Rockchip Graphics"
     Driver "modesetting"
+    # glamor is enabled for 2D acceleration.
+    # NOTE: xrandr --rotate crashes the X server with the Mali BSP blob because
+    # glamor's shadow-framebuffer rotation path is incompatible with this driver.
+    # Screen rotation on X11 is intentionally disabled in the tray app; use the
+    # sway (Wayland) session for smooth, crash-free rotation instead.
     Option "AccelMethod" "glamor"
     Option "DRI" "3"
 EndSection
@@ -434,24 +470,20 @@ FSTAB
 # 9. Autologin LightDM and disable XFCE auto-suspend
 echo "[*] Configuring LightDM autologin..."
 LIGHTDM_CONF="${ROOTFS_MNT}/etc/lightdm/lightdm.conf"
-if [ -f "${LIGHTDM_CONF}" ]; then
-    sed -i 's/^#\?autologin-user=.*/autologin-user=chaos/' "${LIGHTDM_CONF}" || true
-    sed -i 's/^#\?autologin-user-timeout=.*/autologin-user-timeout=0/' "${LIGHTDM_CONF}" || true
-    if ! grep -q '^autologin-user=chaos' "${LIGHTDM_CONF}"; then
-        cat >> "${LIGHTDM_CONF}" << 'LIGHTDM_EOF'
+mkdir -p "${ROOTFS_MNT}/etc/lightdm"
+# Write a complete, authoritative lightdm.conf so there is no ambiguity.
+# - autologin always starts XFCE (X11) — Wayland session must be selected
+#   manually at the greeter after logout.
+# - sessions-directory includes both xsessions (X11) and wayland-sessions.
+cat > "${LIGHTDM_CONF}" << 'LIGHTDM_EOF'
+[LightDM]
+sessions-directory=/usr/share/lightdm/sessions:/usr/share/xsessions:/usr/share/wayland-sessions
+
 [Seat:*]
 autologin-user=chaos
 autologin-user-timeout=0
+autologin-session=xfce
 LIGHTDM_EOF
-    fi
-else
-    mkdir -p "${ROOTFS_MNT}/etc/lightdm"
-    cat > "${LIGHTDM_CONF}" << 'LIGHTDM_EOF'
-[Seat:*]
-autologin-user=chaos
-autologin-user-timeout=0
-LIGHTDM_EOF
-fi
 
 echo "[*] Disabling xfce4-power-manager auto-suspend..."
 # Power manager config
@@ -717,7 +749,7 @@ polkit.addRule(function(action, subject) {
         return;
     }
 
-    if (subject.active && subject.isInGroup("video")) {
+    if (subject.isInGroup("video")) {
         return polkit.Result.YES;
     }
 });
@@ -866,55 +898,124 @@ mkdir -p "${ROOTFS_MNT}/etc/systemd/system/multi-user.target.wants"
 ln -sf /lib/systemd/system/bluetooth.service \
     "${ROOTFS_MNT}/etc/systemd/system/multi-user.target.wants/bluetooth.service"
 
-# Auto-rotate display/touchscreen based on accelerometer readings.
-echo "[*] Installing accelerometer auto-rotate service..."
-mkdir -p "${ROOTFS_MNT}/usr/local/sbin"
-cat > "${ROOTFS_MNT}/usr/local/sbin/rk-autorotate.py" << 'RK_AUTOROTATE'
+# Screen rotation tray icon — manual rotation selector with optional
+# accelerometer auto-rotate.  Replaces the old rk-autorotate.service daemon.
+echo "[*] Installing screen-rotation tray applet..."
+
+# udev rule: let the "video" group read/write the accelerometer device so the
+# tray app (running as the desktop user) can poll it without root.
+cat > "${ROOTFS_MNT}/etc/udev/rules.d/91-accelerometer.rules" << 'ACCEL_UDEV'
+KERNEL=="mma8452_daemon", MODE="0660", GROUP="video"
+ACCEL_UDEV
+
+mkdir -p "${ROOTFS_MNT}/usr/local/bin"
+cat > "${ROOTFS_MNT}/usr/local/bin/rk-screen-rotate.py" << 'RK_SCREEN_ROTATE'
 #!/usr/bin/env python3
+"""System-tray applet for screen rotation on RK3562 tablet.
+
+Works in both X11 (XFCE) and Wayland (labwc) sessions.
+
+Under X11:  uses xrandr for display rotation and xinput for touch mapping.
+Under Wayland: uses wlr-randr for display rotation; the compositor
+               (wlroots/labwc) automatically remaps touch coordinates, so
+               no xinput step is needed.
+"""
+
 import array
 import fcntl
 import os
-import pwd
 import re
 import subprocess
+import threading
 import time
 
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("AyatanaAppIndicator3", "0.1")
+from gi.repository import AyatanaAppIndicator3 as AppIndicator3  # noqa: E402
+from gi.repository import GLib, Gtk  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# Session detection
+# ---------------------------------------------------------------------------
+IS_WAYLAND = os.environ.get("XDG_SESSION_TYPE", "") == "wayland"
+
+# ---------------------------------------------------------------------------
+# Accelerometer constants
+# ---------------------------------------------------------------------------
 SENSOR_DEV = "/dev/mma8452_daemon"
 GSENSOR_IOCTL_START = 0x6103
 GSENSOR_IOCTL_APP_SET_RATE = 0x40026110
 GSENSOR_IOCTL_GETDATA = 0x800D6108
-
 POLL_SECONDS = 0.5
 THRESHOLD = 6000
 STABLE_SAMPLES = 3
 
-MATRICES = {
-    "normal": [1, 0, 0, 0, 1, 0, 0, 0, 1],
-    "left": [0, -1, 1, 1, 0, 0, 0, 0, 1],
-    "right": [0, 1, 0, -1, 0, 1, 0, 0, 1],
-    "inverted": [-1, 0, 1, 0, -1, 1, 0, 0, 1],
+# ---------------------------------------------------------------------------
+# Rotation helpers
+# ---------------------------------------------------------------------------
+ORIENTATIONS = ["normal", "left", "right", "inverted"]
+
+LABELS = {
+    "normal":   "Normal (Portrait)",
+    "left":     "Left (Landscape)",
+    "right":    "Right (Landscape)",
+    "inverted": "Inverted (Portrait)",
 }
 
+# xinput Coordinate Transformation Matrix — X11 only (9 elements)
+MATRICES = {
+    "normal":   [1,  0, 0,  0,  1, 0, 0, 0, 1],
+    "left":     [0, -1, 1,  1,  0, 0, 0, 0, 1],
+    "right":    [0,  1, 0, -1,  0, 1, 0, 0, 1],
+    "inverted": [-1, 0, 1,  0, -1, 1, 0, 0, 1],
+}
 
-def run_user(cmd):
-    user = "chaos"
-    uid = pwd.getpwnam(user).pw_uid
-    env_cmd = [
-        "runuser",
-        "-u",
-        user,
-        "--",
-        "env",
-        "DISPLAY=:0",
-        "XAUTHORITY=/home/chaos/.Xauthority",
-        f"XDG_RUNTIME_DIR=/run/user/{uid}",
-        f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus",
-    ]
-    return subprocess.run(env_cmd + cmd, text=True, capture_output=True)
+# wlr transform names — Wayland only
+WL_TRANSFORMS = {
+    "normal":   "normal",
+    "left":     "270",
+    "right":    "90",
+    "inverted": "180",
+}
+
+# libinput calibration matrices for Wayland (6 elements: a b c d e f)
+# map_to_output doesn't update touch coords on this platform so we set manually.
+# Each matrix is the inverse of the output transform applied to [0,1] touch coords.
+WL_TOUCH_MATRICES = {
+    "normal":   [1,  0, 0,  0,  1, 0],   # identity
+    "right":    [0,  1, 0, -1,  0, 1],   # output transform 90  (CCW)
+    "left":     [0, -1, 1,  1,  0, 0],   # output transform 270 (CW)
+    "inverted": [-1, 0, 1,  0, -1, 1],   # output transform 180
+}
+
+ICON_DEFAULT = "video-display"
 
 
-def connected_output():
-    res = run_user(["xrandr", "--query"])
+def _sway_output():
+    """Return the name of the first active sway output via swaymsg JSON."""
+    res = subprocess.run(
+        ["swaymsg", "-t", "get_outputs"], text=True, capture_output=True
+    )
+    if res.returncode != 0:
+        return None
+    try:
+        import json
+        outputs = json.loads(res.stdout)
+        for o in outputs:
+            if o.get("active"):
+                return o["name"]
+        if outputs:
+            return outputs[0]["name"]
+    except Exception:
+        pass
+    return None
+
+
+def _x11_connected_output():
+    """Return the name of the first connected xrandr output."""
+    res = subprocess.run(["xrandr", "--query"], text=True, capture_output=True)
     if res.returncode != 0:
         return None
     outputs = []
@@ -930,8 +1031,11 @@ def connected_output():
     return outputs[0]
 
 
-def touchscreen_devices():
-    res = run_user(["xinput", "list", "--name-only"])
+def _x11_touchscreen_devices():
+    """Return list of xinput device names matching the touchscreen."""
+    res = subprocess.run(
+        ["xinput", "list", "--name-only"], text=True, capture_output=True
+    )
     if res.returncode != 0:
         return []
     devs = []
@@ -942,117 +1046,562 @@ def touchscreen_devices():
     return devs
 
 
-def apply_orientation(orientation):
-    output = connected_output()
-    if not output:
-        return False
-    xr = run_user(["xrandr", "--output", output, "--rotate", orientation])
-    if xr.returncode != 0:
-        return False
-
-    matrix = MATRICES[orientation]
-    for dev in touchscreen_devices():
-        run_user(
-            [
-                "xinput",
-                "set-prop",
-                dev,
-                "Coordinate Transformation Matrix",
-                *[str(v) for v in matrix],
-            ]
-        )
-    return True
-
-
-def open_sensor():
-    fd = os.open(SENSOR_DEV, os.O_RDWR | os.O_CLOEXEC)
-    fcntl.ioctl(fd, GSENSOR_IOCTL_START, 0)
-    rate = array.array("h", [20])
-    fcntl.ioctl(fd, GSENSOR_IOCTL_APP_SET_RATE, rate, True)
-    return fd
-
-
-def read_axis(fd):
-    vals = array.array("i", [0, 0, 0])
-    fcntl.ioctl(fd, GSENSOR_IOCTL_GETDATA, vals, True)
-    return vals[0], vals[1], vals[2]
-
-
-def detect_orientation(x, y):
-    ax = abs(x)
-    ay = abs(y)
-    if ax < THRESHOLD and ay < THRESHOLD:
+def _sway_touch_identifier():
+    """Return the sway input identifier for the first touch device."""
+    res = subprocess.run(
+        ["swaymsg", "-t", "get_inputs"], text=True, capture_output=True
+    )
+    if res.returncode != 0:
         return None
-    if ax >= ay:
-        return "left" if x > 0 else "right"
-    return "inverted" if y > 0 else "normal"
+    try:
+        import json
+        for dev in json.loads(res.stdout):
+            if dev.get("type") == "touch":
+                return dev["identifier"]
+    except Exception:
+        pass
+    return None
+
+
+def apply_orientation(orientation):
+    """Rotate display and update touch mapping for the current session type."""
+    if IS_WAYLAND:
+        output = _sway_output()
+        if not output:
+            return False
+        # Rotate the output
+        res = subprocess.run(
+            ["swaymsg", "output", output, "transform",
+             WL_TRANSFORMS[orientation]],
+            capture_output=True,
+        )
+        if res.returncode != 0:
+            return False
+        # map_to_output doesn't update touch coords on this platform;
+        # set the libinput calibration matrix manually.
+        touch_id = _sway_touch_identifier()
+        if touch_id:
+            mat = WL_TOUCH_MATRICES[orientation]
+            subprocess.run(
+                ["swaymsg", "--", "input", touch_id, "calibration_matrix",
+                 " ".join(str(v) for v in mat)],
+                capture_output=True,
+            )
+        return True
+    else:
+        # xrandr --rotate (including --rotate normal) crashes the X server with
+        # the Mali BSP glamor driver.  Do not call xrandr at all under X11.
+        # Only update the xinput touch matrix for "normal" to keep calibration.
+        if orientation != "normal":
+            return False
+        matrix = MATRICES["normal"]
+        for dev in _x11_touchscreen_devices():
+            subprocess.run(
+                ["xinput", "set-prop", dev,
+                 "Coordinate Transformation Matrix",
+                 *(str(v) for v in matrix)],
+                capture_output=True,
+            )
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Accelerometer reader (runs in a background thread)
+# ---------------------------------------------------------------------------
+class AccelReader:
+    """Polls the MMA8452 accelerometer and calls *callback(orientation)*
+    on the GLib main-loop when a stable orientation change is detected."""
+
+    def __init__(self, callback):
+        self._callback = callback
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+            self._thread = None
+
+    @property
+    def running(self):
+        return self._thread is not None and self._thread.is_alive()
+
+    @staticmethod
+    def _open_sensor():
+        fd = os.open(SENSOR_DEV, os.O_RDWR | os.O_CLOEXEC)
+        fcntl.ioctl(fd, GSENSOR_IOCTL_START, 0)
+        rate = array.array("h", [20])
+        fcntl.ioctl(fd, GSENSOR_IOCTL_APP_SET_RATE, rate, True)
+        return fd
+
+    @staticmethod
+    def _read_axis(fd):
+        vals = array.array("i", [0, 0, 0])
+        fcntl.ioctl(fd, GSENSOR_IOCTL_GETDATA, vals, True)
+        return vals[0], vals[1], vals[2]
+
+    @staticmethod
+    def _detect(x, y):
+        ax, ay = abs(x), abs(y)
+        if ax < THRESHOLD and ay < THRESHOLD:
+            return None
+        if ax >= ay:
+            return "left" if x > 0 else "right"
+        return "inverted" if y > 0 else "normal"
+
+    def _run(self):
+        fd = None
+        pending = None
+        pending_count = 0
+        while not self._stop.is_set():
+            try:
+                if fd is None:
+                    if not os.path.exists(SENSOR_DEV):
+                        time.sleep(1.0)
+                        continue
+                    fd = self._open_sensor()
+                x, y, _ = self._read_axis(fd)
+                orient = self._detect(x, y)
+                if orient is not None:
+                    if orient == pending:
+                        pending_count += 1
+                    else:
+                        pending = orient
+                        pending_count = 1
+                    if pending_count >= STABLE_SAMPLES:
+                        GLib.idle_add(self._callback, orient)
+                        pending_count = 0
+                time.sleep(POLL_SECONDS)
+            except Exception:
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    fd = None
+                time.sleep(1.0)
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Tray applet
+# ---------------------------------------------------------------------------
+class RotateTray:
+    def __init__(self):
+        self._current = "normal"
+        self._auto = False
+        self._accel = AccelReader(self._on_accel_orient)
+
+        self._indicator = AppIndicator3.Indicator.new(
+            "rk-screen-rotate",
+            ICON_DEFAULT,
+            AppIndicator3.IndicatorCategory.HARDWARE,
+        )
+        self._indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
+        self._indicator.set_title("Screen Rotation")
+        self._build_menu()
+
+    def _build_menu(self):
+        menu = Gtk.Menu()
+
+        self._auto_item = Gtk.CheckMenuItem(label="Auto-rotate")
+        self._auto_item.set_active(self._auto)
+        if not IS_WAYLAND:
+            self._auto_item.set_sensitive(False)
+        self._auto_item.connect("toggled", self._on_auto_toggled)
+        menu.append(self._auto_item)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        if not IS_WAYLAND:
+            note = Gtk.MenuItem(
+                label="⚠ Rotation only works in sway (Wayland)"
+            )
+            note.set_sensitive(False)
+            menu.append(note)
+
+        self._orient_items = {}
+        group = None
+        for orient in ORIENTATIONS:
+            if group is None:
+                item = Gtk.RadioMenuItem(label=LABELS[orient])
+                group = item
+            else:
+                item = Gtk.RadioMenuItem.new_with_label_from_widget(
+                    group, LABELS[orient]
+                )
+            if orient == self._current:
+                item.set_active(True)
+            # Disable non-normal options on X11 — xrandr --rotate crashes Xorg
+            if not IS_WAYLAND and orient != "normal":
+                item.set_sensitive(False)
+            item.connect("toggled", self._on_orient_toggled, orient)
+            self._orient_items[orient] = item
+            menu.append(item)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        quit_item = Gtk.MenuItem(label="Quit")
+        quit_item.connect("activate", self._on_quit)
+        menu.append(quit_item)
+
+        menu.show_all()
+        self._indicator.set_menu(menu)
+
+    def _on_orient_toggled(self, item, orient):
+        if not item.get_active():
+            return
+        if orient == self._current:
+            return
+        if self._auto:
+            self._auto = False
+            self._accel.stop()
+            self._auto_item.set_active(False)
+        self._apply(orient)
+
+    def _on_auto_toggled(self, item):
+        self._auto = item.get_active()
+        if self._auto:
+            self._accel.start()
+        else:
+            self._accel.stop()
+
+    def _on_accel_orient(self, orient):
+        if not self._auto:
+            return
+        if orient == self._current:
+            return
+        self._apply(orient)
+        item = self._orient_items.get(orient)
+        if item and not item.get_active():
+            item.set_active(True)
+
+    def _on_quit(self, _item):
+        self._accel.stop()
+        Gtk.main_quit()
+
+    def _apply(self, orient):
+        if apply_orientation(orient):
+            self._current = orient
+
+    def run(self):
+        Gtk.main()
 
 
 def main():
-    fd = None
-    current = None
-    pending = None
-    pending_count = 0
-
-    while True:
-        try:
-            if fd is None:
-                if not os.path.exists(SENSOR_DEV):
-                    time.sleep(1.0)
-                    continue
-                fd = open_sensor()
-
-            x, y, _ = read_axis(fd)
-            orient = detect_orientation(x, y)
-            if orient is None:
-                time.sleep(POLL_SECONDS)
-                continue
-
-            if orient == pending:
-                pending_count += 1
-            else:
-                pending = orient
-                pending_count = 1
-
-            if pending_count >= STABLE_SAMPLES and orient != current:
-                if apply_orientation(orient):
-                    current = orient
-
-            time.sleep(POLL_SECONDS)
-        except Exception:
-            if fd is not None:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-            fd = None
-            time.sleep(1.0)
+    auto_start = os.path.exists(SENSOR_DEV) and os.access(
+        SENSOR_DEV, os.R_OK | os.W_OK
+    )
+    app = RotateTray()
+    if auto_start:
+        app._auto = True
+        app._auto_item.set_active(True)
+        app._accel.start()
+    app.run()
 
 
 if __name__ == "__main__":
     main()
-RK_AUTOROTATE
-chmod +x "${ROOTFS_MNT}/usr/local/sbin/rk-autorotate.py"
+RK_SCREEN_ROTATE
+chmod +x "${ROOTFS_MNT}/usr/local/bin/rk-screen-rotate.py"
 
-cat > "${ROOTFS_MNT}/etc/systemd/system/rk-autorotate.service" << 'RK_AUTOROTATE_UNIT'
-[Unit]
-Description=Auto-rotate display using accelerometer
-After=graphical.target lightdm.service
-Wants=graphical.target
+# Autostart the tray applet inside the XFCE session.
+mkdir -p "${ROOTFS_MNT}/etc/xdg/autostart"
+cat > "${ROOTFS_MNT}/etc/xdg/autostart/rk-screen-rotate.desktop" << 'RK_ROTATE_DESKTOP'
+[Desktop Entry]
+Type=Application
+Name=Screen Rotation
+Comment=Tray applet for screen rotation control
+Exec=/usr/local/bin/rk-screen-rotate.py
+Icon=video-display
+X-GNOME-Autostart-enabled=true
+OnlyShowIn=XFCE;
+RK_ROTATE_DESKTOP
 
-[Service]
-Type=simple
-ExecStart=/usr/local/sbin/rk-autorotate.py
-Restart=always
-RestartSec=2
+# ── Wayland / sway alternate session ─────────────────────────────────────────
+# Everything below is isolated to the sway session.  The XFCE/X11 session is
+# completely unaffected: LightDM autologins to xfce by default; sway config
+# lives in its own directory; all autostart entries use OnlyShowIn=sway.
+# sway is in Debian Bookworm (v1.7.2) — no external repos needed.
+echo "[*] Installing sway Wayland session..."
 
-[Install]
-WantedBy=graphical.target
-RK_AUTOROTATE_UNIT
+# Session wrapper — sets env vars sway needs on a BSP Rockchip kernel.
+mkdir -p "${ROOTFS_MNT}/usr/local/bin"
+cat > "${ROOTFS_MNT}/usr/local/bin/rk-sway-session.sh" << 'RK_SWAY_SESSION'
+#!/bin/sh
+# No hardware cursor plane on RK3562 Esmart-only VOP2
+export WLR_NO_HARDWARE_CURSORS=1
+# Use DRM/KMS backend (explicit, in case DISPLAY is set from su/ssh)
+export WLR_BACKENDS=drm,libinput
+# Force libseat to use logind for device access (input group not required)
+export LIBSEAT_BACKEND=logind
+export XDG_SESSION_TYPE=wayland
+export XDG_CURRENT_DESKTOP=sway
+export GDK_BACKEND=wayland,x11
+export QT_QPA_PLATFORM="wayland;xcb"
+export SDL_VIDEODRIVER=wayland
+export MOZ_ENABLE_WAYLAND=1
+export MOZ_DISABLE_RDD_SANDBOX=1
+export _JAVA_AWT_WM_NONREPARENTING=1
+exec sway
+RK_SWAY_SESSION
+chmod +x "${ROOTFS_MNT}/usr/local/bin/rk-sway-session.sh"
 
-mkdir -p "${ROOTFS_MNT}/etc/systemd/system/graphical.target.wants"
-ln -sf /etc/systemd/system/rk-autorotate.service \
-    "${ROOTFS_MNT}/etc/systemd/system/graphical.target.wants/rk-autorotate.service"
+# LightDM Wayland session entry — overrides the one shipped by the sway
+# package so our wrapper script is used (for the env vars above).
+mkdir -p "${ROOTFS_MNT}/usr/share/wayland-sessions"
+cat > "${ROOTFS_MNT}/usr/share/wayland-sessions/sway.desktop" << 'SWAY_SESSION'
+[Desktop Entry]
+Name=sway (Wayland)
+Comment=sway wlroots Wayland compositor
+Exec=/usr/local/bin/rk-sway-session.sh
+Type=Application
+DesktopNames=sway
+SWAY_SESSION
+
+# sway configuration
+mkdir -p "${ROOTFS_MNT}/home/chaos/.config/sway"
+cat > "${ROOTFS_MNT}/home/chaos/.config/sway/config" << 'SWAY_CFG'
+### Variables
+set $mod Mod4
+
+### Disable Xwayland — Mali glamor crashes under Xwayland (same as X11)
+xwayland disable
+
+### Output
+output * bg #1e2126 solid_color
+
+### Input
+input type:touchscreen {
+    tap enabled
+    natural_scroll disabled
+    map_to_output DSI-1
+}
+
+### Title bars: taller for touch-friendly tap targets
+default_border normal 2
+titlebar_padding 10 12
+font pango:sans 12
+
+### Key bindings
+bindsym $mod+Return exec foot
+bindsym $mod+q kill
+bindsym $mod+Shift+e exec swaymsg exit
+
+### All windows float (tablet-friendly)
+for_window [app_id=".*"] floating enable
+
+### Panel — sway manages waybar lifecycle
+bar {
+    swaybar_command waybar
+}
+
+### Autostart
+# Wait for waybar tray to be ready before starting the SNI rotation applet
+exec sh -c "sleep 3 && /usr/local/bin/rk-screen-rotate.py"
+exec nm-applet --indicator
+SWAY_CFG
+
+# Touch-friendly power menu — uses wofi dmenu so each option is a large tap
+# target.  Kills any leftover instance before opening to prevent stacking.
+cat > "${ROOTFS_MNT}/usr/local/bin/rk-power-menu.sh" << 'RK_POWER_MENU'
+#!/bin/sh
+# Kill any existing power-menu wofi instance to prevent stacking on repeated taps.
+pkill -f "wofi.*rk-power-menu" 2>/dev/null || true
+sleep 0.05
+
+choice=$(printf 'Shutdown\nReboot\nLogout\nCancel' | \
+    wofi --dmenu \
+         --prompt='Power' \
+         --width=320 \
+         --height=240 \
+         --cache-file=/dev/null \
+         --hide-search \
+         2>/dev/null)
+
+case "${choice}" in
+    Shutdown) systemctl poweroff ;;
+    Reboot)   systemctl reboot ;;
+    Logout)   swaymsg exit ;;
+esac
+RK_POWER_MENU
+chmod +x "${ROOTFS_MNT}/usr/local/bin/rk-power-menu.sh"
+
+# Panel launcher: prefers waybar, falls back to swaybar (already in sway config)
+cat > "${ROOTFS_MNT}/usr/local/bin/rk-sway-panel.sh" << 'RK_SWAY_PANEL'
+#!/bin/sh
+# Kill any existing panel instances before (re)starting
+pkill -x waybar 2>/dev/null || true
+if command -v waybar >/dev/null 2>&1; then
+    exec waybar
+fi
+# waybar not available — swaybar is handled by the bar{} block in sway config
+RK_SWAY_PANEL
+chmod +x "${ROOTFS_MNT}/usr/local/bin/rk-sway-panel.sh"
+
+# Simple swaybar status script (clock + battery)
+cat > "${ROOTFS_MNT}/usr/local/bin/rk-swaybar-status.sh" << 'RK_SWAY_STATUS'
+#!/bin/sh
+while true; do
+    BAT_CAP=""
+    BAT_FILE="/sys/class/power_supply/rk817-battery/capacity"
+    STATUS_FILE="/sys/class/power_supply/rk817-battery/status"
+    if [ -r "${BAT_FILE}" ]; then
+        CAP=$(cat "${BAT_FILE}")
+        STS=$(cat "${STATUS_FILE}" 2>/dev/null || echo "")
+        case "${STS}" in
+            Charging)    BAT_CAP=" ${CAP}%+" ;;
+            Discharging) BAT_CAP=" ${CAP}%" ;;
+            Full)        BAT_CAP=" Full" ;;
+            *)           BAT_CAP=" ${CAP}%" ;;
+        esac
+    fi
+    echo "$(date +'%a %d %b  %H:%M')${BAT_CAP}"
+    sleep 30
+done
+RK_SWAY_STATUS
+chmod +x "${ROOTFS_MNT}/usr/local/bin/rk-swaybar-status.sh"
+
+# waybar configuration (used when waybar is installed)
+mkdir -p "${ROOTFS_MNT}/home/chaos/.config/waybar"
+cat > "${ROOTFS_MNT}/home/chaos/.config/waybar/config" << 'WAYBAR_CFG'
+{
+    "layer": "top",
+    "position": "top",
+    "height": 40,
+    "spacing": 4,
+    "modules-left": ["custom/apps", "custom/close"],
+    "modules-center": ["clock"],
+    "modules-right": ["tray", "backlight", "pulseaudio", "battery", "network", "custom/power"],
+
+    "custom/apps": {
+        "format": " Apps",
+        "on-click": "wofi --show drun --allow-images --width 400 --height 500",
+        "tooltip": false
+    },
+    "custom/close": {
+        "format": "✕",
+        "on-click": "swaymsg kill",
+        "tooltip": "Close focused window"
+    },
+    "clock": {
+        "format": "{:%H:%M}",
+        "format-alt": "{:%a %d %b  %H:%M}",
+        "tooltip-format": "{:%A, %d %B %Y}"
+    },
+    "tray": {
+        "spacing": 8,
+        "icon-size": 20
+    },
+    "backlight": {
+        "format": "{percent}% {icon}",
+        "format-icons": ["󰃞", "󰃟", "󰃠"],
+        "on-scroll-up": "brightnessctl set +5%",
+        "on-scroll-down": "brightnessctl set 5%-",
+        "on-click": "brightnessctl set +10%"
+    },
+    "battery": {
+        "bat": "battery",
+        "interval": 30,
+        "format": "{capacity}% {icon}",
+        "format-charging": "{capacity}%+",
+        "format-icons": ["", "", "", "", ""],
+        "states": { "warning": 20, "critical": 10 }
+    },
+    "network": {
+        "interval": 10,
+        "format-wifi": "{essid}",
+        "format-disconnected": "No net"
+    },
+    "pulseaudio": {
+        "format": "{volume}% ",
+        "format-muted": "Muted",
+        "on-click": "pavucontrol"
+    },
+    "custom/power": {
+        "format": "⏻",
+        "on-click": "/usr/local/bin/rk-power-menu.sh",
+        "tooltip": false
+    }
+}
+WAYBAR_CFG
+
+cat > "${ROOTFS_MNT}/home/chaos/.config/waybar/style.css" << 'WAYBAR_CSS'
+* {
+    font-family: "DejaVu Sans", sans-serif;
+    font-size: 13px;
+    min-height: 0;
+}
+window#waybar {
+    background-color: #1e2126;
+    color: #abb2bf;
+    border-bottom: 2px solid #3e4452;
+}
+#clock        { color: #e5c07b; font-weight: bold; }
+#battery      { color: #98c379; }
+#battery.warning  { color: #e5c07b; }
+#battery.critical { color: #e06c75; }
+#network      { color: #61afef; }
+#pulseaudio   { color: #c678dd; }
+WAYBAR_CSS
+
+# wofi app launcher config — touch-friendly sizing
+mkdir -p "${ROOTFS_MNT}/home/chaos/.config/wofi"
+cat > "${ROOTFS_MNT}/home/chaos/.config/wofi/style.css" << 'WOFI_CSS'
+window {
+    background-color: #1e2126;
+    border: 2px solid #61afef;
+    border-radius: 8px;
+}
+#input {
+    background-color: #282c34;
+    color: #abb2bf;
+    border: none;
+    padding: 12px;
+    font-size: 16px;
+}
+#entry {
+    padding: 10px 12px;
+    color: #abb2bf;
+    font-size: 15px;
+}
+#entry:selected {
+    background-color: #3e4452;
+    color: #61afef;
+}
+WOFI_CSS
+
+# Fix ownership of all newly created config dirs to the chaos user.
+chroot "${ROOTFS_MNT}" chown -R chaos:chaos /home/chaos/.config/sway
+chroot "${ROOTFS_MNT}" chown -R chaos:chaos /home/chaos/.config/waybar
+chroot "${ROOTFS_MNT}" chown -R chaos:chaos /home/chaos/.config/wofi
+
+# Wayland env-vars profile — only activates inside a Wayland session.
+# Keeps X11 sessions completely unaffected.
+cat > "${ROOTFS_MNT}/etc/profile.d/rk-wayland.sh" << 'RK_WAYLAND_PROFILE'
+if [ "${XDG_SESSION_TYPE:-}" = "wayland" ]; then
+    export GDK_BACKEND=wayland,x11
+    export QT_QPA_PLATFORM="wayland;xcb"
+    export SDL_VIDEODRIVER=wayland
+    export MOZ_ENABLE_WAYLAND=1
+    export MOZ_DISABLE_RDD_SANDBOX=1
+    export ELECTRON_OZONE_PLATFORM_HINT=auto
+fi
+RK_WAYLAND_PROFILE
+
+# ── End Wayland / sway section ────────────────────────────────────────────────
 
 # Initialize ALSA controls at boot so speaker/mic paths are sane on RK817.
 echo "[*] Installing ALSA init service..."
