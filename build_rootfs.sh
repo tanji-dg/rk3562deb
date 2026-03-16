@@ -99,7 +99,19 @@ apt-get update -qq
 # Note: xwayland disabled — Mali glamor crashes under Xwayland same as X11.
 # foot: Wayland-native terminal — required because xwayland is disabled so
 # xfce4-terminal and other X11 terminals won't launch in this session.
-apt-get install -y sway swaybg wofi jq foot
+apt-get install -y sway swaybg wofi jq foot mako-notifier
+
+# wvkbd: Wayland-native on-screen keyboard (wlroots virtual-keyboard protocol).
+# Replaces onboard (X11-only) in the Sway session.
+# squeekboard: OSK that uses the input-method-v1 protocol — auto-shows when a
+# text field gains focus in GTK/Qt apps.  Not in Bookworm stable; skip if absent.
+for optional_pkg in wvkbd squeekboard; do
+    if apt-get install -y "${optional_pkg}" 2>/dev/null; then
+        echo "[+] Installed ${optional_pkg}"
+    else
+        echo "[!] ${optional_pkg} not in Bookworm — skipping"
+    fi
+done
 
 # Optional Wayland tools — install if available in Bookworm, skip otherwise.
 for optional_pkg in waybar grim slurp wlr-randr; do
@@ -458,6 +470,178 @@ if [ "${FF_VAAPI_ENABLED}" = "true" ]; then
     echo "MOZ_WEBRENDER=1" >> "${ROOTFS_MNT}/etc/environment"
 fi
 
+# ── Custom Plymouth boot splash ────────────────────────────────────────────
+# Replaces the plain black screen with a navy gradient, "RK3562 / Debian
+# GNU/Linux" text, a faded divider line, and 5 pulsing dots.
+# PNG assets are generated with pure Python (no PIL dependency).
+echo "[*] Installing custom Plymouth boot splash..."
+THEME_DIR="${ROOTFS_MNT}/usr/share/plymouth/themes/rkdebian"
+mkdir -p "${THEME_DIR}"
+
+# dot.png — 14×14 soft-edged white circle for the loading dots
+python3 - "${THEME_DIR}/dot.png" << 'PYGEN'
+import sys, zlib, struct
+
+def write_png(path, w, h, rows_rgba):
+    def chunk(tag, data):
+        crc = zlib.crc32(tag + data) & 0xffffffff
+        return struct.pack('>I', len(data)) + tag + data + struct.pack('>I', crc)
+    raw = b''.join(b'\x00' + bytes(r) for r in rows_rgba)
+    with open(path, 'wb') as f:
+        f.write(b'\x89PNG\r\n\x1a\n')
+        f.write(chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 6, 0, 0, 0)))
+        f.write(chunk(b'IDAT', zlib.compress(raw, 9)))
+        f.write(chunk(b'IEND', b''))
+
+W = H = 14
+cx = cy = W / 2.0
+r  = W / 2.0 - 1.0
+rows = []
+for y in range(H):
+    row = []
+    for x in range(W):
+        d     = ((x + 0.5 - cx)**2 + (y + 0.5 - cy)**2)**0.5
+        alpha = min(255, max(0, int((r - d) * 90)))
+        row  += [255, 255, 255, alpha]
+    rows.append(row)
+write_png(sys.argv[1], W, H, rows)
+PYGEN
+
+# line.png — 280×2 white bar that fades at both edges (decorative divider)
+python3 - "${THEME_DIR}/line.png" << 'PYGEN'
+import sys, zlib, struct
+
+def write_png(path, w, h, rows_rgba):
+    def chunk(tag, data):
+        crc = zlib.crc32(tag + data) & 0xffffffff
+        return struct.pack('>I', len(data)) + tag + data + struct.pack('>I', crc)
+    raw = b''.join(b'\x00' + bytes(r) for r in rows_rgba)
+    with open(path, 'wb') as f:
+        f.write(b'\x89PNG\r\n\x1a\n')
+        f.write(chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 6, 0, 0, 0)))
+        f.write(chunk(b'IDAT', zlib.compress(raw, 9)))
+        f.write(chunk(b'IEND', b''))
+
+W, H = 280, 2
+rows = []
+for y in range(H):
+    row = []
+    for x in range(W):
+        fade  = min(x, W - x) / 28.0
+        alpha = min(255, int(55 * min(1.0, fade)))
+        row  += [255, 255, 255, alpha]
+    rows.append(row)
+write_png(sys.argv[1], W, H, rows)
+PYGEN
+
+# Theme descriptor
+cat > "${THEME_DIR}/rkdebian.plymouth" << 'PLYMOUTH_DESC'
+[Plymouth Theme]
+Name=rkdebian
+Description=RK3562 Debian boot splash
+ModuleName=script
+
+[script]
+ImageDir=/usr/share/plymouth/themes/rkdebian
+ScriptFile=/usr/share/plymouth/themes/rkdebian/rkdebian.script
+PLYMOUTH_DESC
+
+# Animation script — runs inside Plymouth on the framebuffer
+cat > "${THEME_DIR}/rkdebian.script" << 'PLYMOUTH_SCRIPT'
+W = Window.GetWidth();
+H = Window.GetHeight();
+
+# Deep navy → near-black vertical gradient
+Window.SetBackgroundTopColor(0.04, 0.07, 0.17);
+Window.SetBackgroundBottomColor(0.01, 0.02, 0.07);
+
+# ── Title ──────────────────────────────────────────────────────────────────
+title = Image.Text("RK3562", 0.88, 0.93, 1.00, 1.0, "DejaVu Sans Bold 36");
+title_spr = Sprite();
+title_spr.SetImage(title);
+title_spr.SetX(Math.Int(W / 2 - title.GetWidth()  / 2));
+title_spr.SetY(Math.Int(H * 0.37));
+
+# ── Subtitle ───────────────────────────────────────────────────────────────
+sub = Image.Text("Debian GNU/Linux", 0.38, 0.55, 0.82, 1.0, "DejaVu Sans 15");
+sub_spr = Sprite();
+sub_spr.SetImage(sub);
+sub_spr.SetX(Math.Int(W / 2 - sub.GetWidth() / 2));
+sub_spr.SetY(title_spr.GetY() + title.GetHeight() + 10);
+
+# ── Divider line ───────────────────────────────────────────────────────────
+line_img = Image("line.png");
+line_spr = Sprite();
+line_spr.SetImage(line_img);
+line_spr.SetX(Math.Int(W / 2 - line_img.GetWidth() / 2));
+line_spr.SetY(sub_spr.GetY() + sub.GetHeight() + 22);
+line_spr.SetOpacity(0.45);
+
+# ── Pulsing dot loader (5 dots, wave ripple) ───────────────────────────────
+N      = 5;
+STEP   = 22;
+DOT_Y  = Math.Int(H * 0.67);
+ORIGIN = Math.Int(W / 2 - (N - 1) * STEP / 2);
+
+dot_img = Image("dot.png");
+for (i = 0; i < N; i++) {
+    dot[i] = Sprite();
+    dot[i].SetImage(dot_img);
+    dot[i].SetX(ORIGIN + i * STEP - Math.Int(dot_img.GetWidth() / 2));
+    dot[i].SetY(DOT_Y);
+    dot[i].SetOpacity(0.15);
+}
+
+tick = 0;
+fun animate() {
+    tick++;
+    peak = Math.Int(tick / 7) % N;
+    for (i = 0; i < N; i++) {
+        diff = i - peak;
+        if (diff < 0) diff = -diff;
+        opacity = 1.0 - diff * 0.25;
+        if (opacity < 0.10) opacity = 0.10;
+        dot[i].SetOpacity(opacity);
+    }
+}
+Plymouth.SetRefreshFunction(animate);
+PLYMOUTH_SCRIPT
+
+# Activate the theme (overrides the 'spinner' set earlier in the chroot)
+chroot "${ROOTFS_MNT}" plymouth-set-default-theme rkdebian 2>/dev/null || \
+    echo "[!] Warning: could not set Plymouth theme; 'spinner' will be used"
+
+# Add Chromium hardware acceleration flags.
+# Mali G52 is on Chromium's GPU blocklist; --ignore-gpu-blocklist overrides.
+# --use-gl=egl        : use EGL instead of GLX (required for Mali userspace)
+# --enable-gpu-rasterization: GPU-accelerated 2D compositing
+# --enable-zero-copy  : share DMA-BUF textures directly, avoids CPU readback
+# VaapiVideoDecoder   : VAAPI path for H.264/VP9 hardware decode via MPP
+# UseChromeOSDirectVideoDecoder is the CrOS-only decode path; disable it so
+# the standard Linux VAAPI path is used instead.
+echo "[*] Adding Chromium acceleration flags..."
+mkdir -p "${ROOTFS_MNT}/etc/chromium.d"
+if [ "${FF_VAAPI_ENABLED}" = "true" ]; then
+    cat > "${ROOTFS_MNT}/etc/chromium.d/rk3562-hw-accel" << 'CHROMIUM_HW_FLAGS'
+# RK3562 hardware acceleration — sourced by /usr/bin/chromium wrapper
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --use-gl=egl"
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --ignore-gpu-blocklist"
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --enable-gpu-rasterization"
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --enable-zero-copy"
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --enable-features=VaapiVideoDecoder,VaapiVideoDecodeLinuxGL"
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --disable-features=UseChromeOSDirectVideoDecoder"
+CHROMIUM_HW_FLAGS
+else
+    # No rockchip VAAPI driver — still force EGL and unblock GPU rasterization
+    # so compositing uses Mali rather than llvmpipe.
+    cat > "${ROOTFS_MNT}/etc/chromium.d/rk3562-hw-accel" << 'CHROMIUM_EGL_FLAGS'
+# RK3562 EGL/GPU-raster only (no VAAPI driver found at build time)
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --use-gl=egl"
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --ignore-gpu-blocklist"
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --enable-gpu-rasterization"
+CHROMIUM_EGL_FLAGS
+fi
+
 # 8. Setting hostname and fstab
 echo "[*] Setting hostname and fstab..."
 echo "rk3562-debian" > "${ROOTFS_MNT}/etc/hostname"
@@ -472,8 +656,7 @@ echo "[*] Configuring LightDM autologin..."
 LIGHTDM_CONF="${ROOTFS_MNT}/etc/lightdm/lightdm.conf"
 mkdir -p "${ROOTFS_MNT}/etc/lightdm"
 # Write a complete, authoritative lightdm.conf so there is no ambiguity.
-# - autologin always starts XFCE (X11) — Wayland session must be selected
-#   manually at the greeter after logout.
+# - autologin starts Sway (Wayland) by default.
 # - sessions-directory includes both xsessions (X11) and wayland-sessions.
 cat > "${LIGHTDM_CONF}" << 'LIGHTDM_EOF'
 [LightDM]
@@ -482,7 +665,7 @@ sessions-directory=/usr/share/lightdm/sessions:/usr/share/xsessions:/usr/share/w
 [Seat:*]
 autologin-user=chaos
 autologin-user-timeout=0
-autologin-session=xfce
+autologin-session=sway
 LIGHTDM_EOF
 
 echo "[*] Disabling xfce4-power-manager auto-suspend..."
@@ -1378,12 +1561,18 @@ mkdir -p "${ROOTFS_MNT}/home/chaos/.config/sway"
 cat > "${ROOTFS_MNT}/home/chaos/.config/sway/config" << 'SWAY_CFG'
 ### Variables
 set $mod Mod4
+set $term foot
+set $menu /usr/local/bin/rk-launcher.sh
+set $kbd  /usr/local/bin/rk-keyboard-toggle.sh
 
 ### Disable Xwayland — Mali glamor crashes under Xwayland (same as X11)
 xwayland disable
 
-### Output
-output * bg #1e2126 solid_color
+### Output — 800×1280 portrait panel; default landscape = 270° CW
+# rk-screen-rotate.py will update this at runtime; setting it here avoids
+# the portrait flash while the tray applet starts.
+output DSI-1 transform 270
+output * bg #1a1b26 solid_color
 
 ### Input
 input type:touchscreen {
@@ -1392,28 +1581,53 @@ input type:touchscreen {
     map_to_output DSI-1
 }
 
-### Title bars: taller for touch-friendly tap targets
-default_border normal 2
-titlebar_padding 10 12
-font pango:sans 12
+### Font and borders
+font pango:DejaVu Sans 13
+default_border pixel 2
+default_floating_border pixel 2
+smart_borders on
+gaps inner 6
+gaps outer 0
+
+### Focus highlight colors (Tokyo Night palette)
+client.focused          #7aa2f7 #24283b #c0caf5 #7aa2f7 #7aa2f7
+client.unfocused        #292e42 #1a1b26 #545c7e #292e42 #292e42
+client.focused_inactive #292e42 #1a1b26 #c0caf5 #292e42 #292e42
+client.urgent           #f7768e #1a1b26 #f7768e #f7768e #f7768e
+
+### Default layout: tabbed — apps fill the screen, switch via tab bar at top
+workspace_layout tabbed
+
+### Window rules — dialogs float centered, most apps tile
+for_window [window_role="dialog"]           floating enable, border pixel 2, move position center
+for_window [window_role="pop-up"]           floating enable, border pixel 2, move position center
+for_window [app_id="pavucontrol"]           floating enable, resize set 640 420, move position center
+for_window [app_id="nm-connection-editor"]  floating enable, resize set 640 520, move position center
+for_window [app_id=".*[Ss]ettings.*"]       floating enable, move position center
+for_window [title=".*[Pp]references.*"]     floating enable, move position center
 
 ### Key bindings
-bindsym $mod+Return exec foot
-bindsym $mod+q kill
+bindsym $mod+Return exec $term
+bindsym $mod+d      exec $menu
+bindsym $mod+k      exec $kbd
+bindsym $mod+q      kill
+bindsym $mod+f      fullscreen toggle
+bindsym $mod+Tab    focus next sibling
+bindsym $mod+Shift+Tab focus prev sibling
 bindsym $mod+Shift+e exec swaymsg exit
 
-### All windows float (tablet-friendly)
-for_window [app_id=".*"] floating enable
-
-### Panel — sway manages waybar lifecycle
+### Panel
 bar {
     swaybar_command waybar
 }
 
 ### Autostart
-# Wait for waybar tray to be ready before starting the SNI rotation applet
-exec sh -c "sleep 3 && /usr/local/bin/rk-screen-rotate.py"
+exec /usr/local/bin/rk-screen-rotate.py
 exec nm-applet --indicator
+exec mako
+# squeekboard: auto-shows when a text field gains focus (input-method protocol).
+# No-op if not installed.
+exec sh -c 'command -v squeekboard >/dev/null 2>&1 && exec squeekboard'
 SWAY_CFG
 
 # Touch-friendly power menu — uses wofi dmenu so each option is a large tap
@@ -1440,6 +1654,42 @@ case "${choice}" in
 esac
 RK_POWER_MENU
 chmod +x "${ROOTFS_MNT}/usr/local/bin/rk-power-menu.sh"
+
+# Single-instance app launcher — kills any existing wofi before opening a new one
+# so multiple rapid taps don't stack a dozen launcher windows.
+cat > "${ROOTFS_MNT}/usr/local/bin/rk-launcher.sh" << 'RK_LAUNCHER'
+#!/bin/sh
+if pgrep -x wofi > /dev/null 2>&1; then
+    pkill -x wofi
+    exit 0
+fi
+exec wofi --show drun \
+          --width 800 --height 1280 \
+          --cache-file=/dev/null \
+          --no-actions \
+          --allow-images \
+          --columns 4 \
+          2>/dev/null
+RK_LAUNCHER
+chmod +x "${ROOTFS_MNT}/usr/local/bin/rk-launcher.sh"
+
+# wvkbd toggle — shows/hides the on-screen keyboard at the bottom of the screen.
+# wvkbd-mobintl is the standard mobile-international layout binary.
+cat > "${ROOTFS_MNT}/usr/local/bin/rk-keyboard-toggle.sh" << 'RK_KBD_TOGGLE'
+#!/bin/sh
+KBD_BIN=""
+for b in wvkbd-mobintl wvkbd; do
+    command -v "$b" > /dev/null 2>&1 && KBD_BIN="$b" && break
+done
+[ -z "$KBD_BIN" ] && exit 0
+
+if pgrep -x "$KBD_BIN" > /dev/null 2>&1; then
+    pkill -x "$KBD_BIN"
+else
+    exec "$KBD_BIN" --landscape-layers full,special -H 260 -L 300 &
+fi
+RK_KBD_TOGGLE
+chmod +x "${ROOTFS_MNT}/usr/local/bin/rk-keyboard-toggle.sh"
 
 # Panel launcher: prefers waybar, falls back to swaybar (already in sway config)
 cat > "${ROOTFS_MNT}/usr/local/bin/rk-sway-panel.sh" << 'RK_SWAY_PANEL'
@@ -1482,21 +1732,32 @@ cat > "${ROOTFS_MNT}/home/chaos/.config/waybar/config" << 'WAYBAR_CFG'
 {
     "layer": "top",
     "position": "top",
-    "height": 40,
-    "spacing": 4,
-    "modules-left": ["custom/apps", "custom/close"],
+    "height": 52,
+    "spacing": 0,
+    "modules-left": ["custom/apps", "custom/kbd", "custom/close"],
     "modules-center": ["clock"],
     "modules-right": ["tray", "backlight", "pulseaudio", "battery", "network", "custom/power"],
 
     "custom/apps": {
-        "format": " Apps",
-        "on-click": "wofi --show drun --allow-images --width 400 --height 500",
-        "tooltip": false
+        "format": "Apps",
+        "on-click": "/usr/local/bin/rk-launcher.sh",
+        "on-click-touch": "/usr/local/bin/rk-launcher.sh",
+        "tooltip": false,
+        "min-width": 70
+    },
+    "custom/kbd": {
+        "format": "kbd",
+        "on-click": "/usr/local/bin/rk-keyboard-toggle.sh",
+        "on-click-touch": "/usr/local/bin/rk-keyboard-toggle.sh",
+        "tooltip": false,
+        "min-width": 60
     },
     "custom/close": {
-        "format": "✕",
+        "format": "Close",
         "on-click": "swaymsg kill",
-        "tooltip": "Close focused window"
+        "on-click-touch": "swaymsg kill",
+        "tooltip": false,
+        "min-width": 70
     },
     "clock": {
         "format": "{:%H:%M}",
@@ -1504,37 +1765,42 @@ cat > "${ROOTFS_MNT}/home/chaos/.config/waybar/config" << 'WAYBAR_CFG'
         "tooltip-format": "{:%A, %d %B %Y}"
     },
     "tray": {
-        "spacing": 8,
-        "icon-size": 20
+        "spacing": 10,
+        "icon-size": 22
     },
     "backlight": {
-        "format": "{percent}% {icon}",
-        "format-icons": ["󰃞", "󰃟", "󰃠"],
+        "format": "{percent}%☀",
         "on-scroll-up": "brightnessctl set +5%",
         "on-scroll-down": "brightnessctl set 5%-",
-        "on-click": "brightnessctl set +10%"
+        "on-click": "brightnessctl set +10%",
+        "tooltip": false
     },
     "battery": {
-        "bat": "battery",
+        "bat": "rk817-battery",
         "interval": 30,
-        "format": "{capacity}% {icon}",
+        "format": "{capacity}%{icon}",
         "format-charging": "{capacity}%+",
-        "format-icons": ["", "", "", "", ""],
-        "states": { "warning": 20, "critical": 10 }
+        "format-icons": ["▁", "▃", "▅", "▇", "█"],
+        "states": { "warning": 20, "critical": 10 },
+        "tooltip": false
     },
     "network": {
-        "interval": 10,
+        "interval": 15,
         "format-wifi": "{essid}",
-        "format-disconnected": "No net"
+        "format-disconnected": "no wifi",
+        "tooltip": false
     },
     "pulseaudio": {
-        "format": "{volume}% ",
-        "format-muted": "Muted",
-        "on-click": "pavucontrol"
+        "format": "{volume}%♪",
+        "format-muted": "mute",
+        "on-click": "pavucontrol",
+        "on-click-touch": "pavucontrol",
+        "tooltip": false
     },
     "custom/power": {
-        "format": "⏻",
+        "format": "pwr",
         "on-click": "/usr/local/bin/rk-power-menu.sh",
+        "on-click-touch": "/usr/local/bin/rk-power-menu.sh",
         "tooltip": false
     }
 }
@@ -1545,50 +1811,127 @@ cat > "${ROOTFS_MNT}/home/chaos/.config/waybar/style.css" << 'WAYBAR_CSS'
     font-family: "DejaVu Sans", sans-serif;
     font-size: 13px;
     min-height: 0;
+    border: none;
+    border-radius: 0;
+    padding: 0;
+    margin: 0;
 }
+
 window#waybar {
-    background-color: #1e2126;
-    color: #abb2bf;
-    border-bottom: 2px solid #3e4452;
+    background-color: #1a1b26;
+    color: #c0caf5;
+    border-bottom: 2px solid #3b4261;
 }
-#clock        { color: #e5c07b; font-weight: bold; }
-#battery      { color: #98c379; }
-#battery.warning  { color: #e5c07b; }
-#battery.critical { color: #e06c75; }
-#network      { color: #61afef; }
-#pulseaudio   { color: #c678dd; }
+
+/* Right side modules */
+#clock, #tray, #backlight, #pulseaudio, #battery, #network, #custom-power {
+    padding: 0 10px;
+    color: #c0caf5;
+}
+
+/* Left action buttons — pill style, clearly separated */
+#custom-apps, #custom-kbd, #custom-close {
+    padding: 6px 16px;
+    margin: 6px 4px;
+    border-radius: 8px;
+    font-weight: bold;
+    font-size: 14px;
+}
+
+#custom-apps  { background-color: #3d59a1; color: #c0caf5; }
+#custom-kbd   { background-color: #33635c; color: #c0caf5; }
+#custom-close { background-color: #8c3a4a; color: #c0caf5; }
+
+#custom-apps:hover  { background-color: #4e6ab5; }
+#custom-kbd:hover   { background-color: #3d7a72; }
+#custom-close:hover { background-color: #a34555; }
+
+/* Center clock */
+#clock {
+    font-size: 15px;
+    font-weight: bold;
+    color: #e0af68;
+}
+
+#battery         { color: #9ece6a; }
+#battery.warning { color: #e0af68; }
+#battery.critical{ color: #f7768e; }
+#battery.charging{ color: #73daca; }
+#network         { color: #7dcfff; }
+#pulseaudio      { color: #bb9af7; }
+#backlight       { color: #b4f9f8; }
+#custom-power    { color: #f7768e; font-weight: bold; }
 WAYBAR_CSS
 
 # wofi app launcher config — touch-friendly sizing
 mkdir -p "${ROOTFS_MNT}/home/chaos/.config/wofi"
 cat > "${ROOTFS_MNT}/home/chaos/.config/wofi/style.css" << 'WOFI_CSS'
 window {
-    background-color: #1e2126;
-    border: 2px solid #61afef;
-    border-radius: 8px;
+    background-color: #1a1b26;
+    font-family: "DejaVu Sans", sans-serif;
 }
 #input {
-    background-color: #282c34;
-    color: #abb2bf;
-    border: none;
-    padding: 12px;
-    font-size: 16px;
+    background-color: #24283b;
+    color: #c0caf5;
+    border: 1px solid #3b4261;
+    border-radius: 8px;
+    padding: 14px 16px;
+    font-size: 18px;
+    margin: 12px;
+    caret-color: #7aa2f7;
+}
+#scroll {
+    margin: 0 6px 6px 6px;
+}
+#inner-box {
+    background-color: transparent;
+}
+#outer-box {
+    background-color: #1a1b26;
 }
 #entry {
-    padding: 10px 12px;
-    color: #abb2bf;
-    font-size: 15px;
+    padding: 12px 6px;
+    color: #c0caf5;
+    font-size: 13px;
+    border-radius: 10px;
+    margin: 4px;
 }
 #entry:selected {
-    background-color: #3e4452;
-    color: #61afef;
+    background-color: #2a2d3e;
+    color: #7aa2f7;
+}
+#img {
+    margin-bottom: 6px;
+}
+#text {
+    color: inherit;
+    font-size: 13px;
+    margin-top: 4px;
 }
 WOFI_CSS
+
+# mako notification daemon config
+mkdir -p "${ROOTFS_MNT}/home/chaos/.config/mako"
+cat > "${ROOTFS_MNT}/home/chaos/.config/mako/config" << 'MAKO_CFG'
+font=DejaVu Sans 13
+background-color=#1a1b26
+text-color=#c0caf5
+border-color=#7aa2f7
+border-radius=8
+border-size=2
+width=340
+height=120
+padding=14
+margin=10
+anchor=top-right
+default-timeout=5000
+MAKO_CFG
 
 # Fix ownership of all newly created config dirs to the chaos user.
 chroot "${ROOTFS_MNT}" chown -R chaos:chaos /home/chaos/.config/sway
 chroot "${ROOTFS_MNT}" chown -R chaos:chaos /home/chaos/.config/waybar
 chroot "${ROOTFS_MNT}" chown -R chaos:chaos /home/chaos/.config/wofi
+chroot "${ROOTFS_MNT}" chown -R chaos:chaos /home/chaos/.config/mako
 
 # Wayland env-vars profile — only activates inside a Wayland session.
 # Keeps X11 sessions completely unaffected.
