@@ -82,7 +82,8 @@ apt-get install -y sudo curl wget nano vim openssh-server network-manager wpasup
     python3 python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 \
     iproute2 iputils-ping dnsutils locales tzdata xfce4-power-manager upower brightnessctl rfkill \
     vainfo vdpauinfo \
-    onboard wireless-regdb firmware-brcm80211
+    onboard wireless-regdb firmware-brcm80211 \
+    gnome-themes-extra gnome-themes-extra-data adwaita-icon-theme
 
 # Remove any Trixie apt source that may be left over from a previous failed
 # build attempt.  Trixie packages require libc6 >= 2.38 which Bookworm does
@@ -422,6 +423,64 @@ Section "Device"
 EndSection
 XORG_GPU
 
+# Build rockchip_drv_video.so (Rockchip VAAPI driver) inside the chroot.
+# Sources: sujit-168/rk_hw_base (MPP+RGA middleware) and sujit-168/rk_vaapi_driver.
+# librga prebuilt (aarch64) is pulled from airockchip/librga.
+echo "[*] Building Rockchip VAAPI driver inside chroot..."
+cat > "${ROOTFS_MNT}/tmp/build_vaapi.sh" << 'BUILD_VAAPI_EOF'
+#!/bin/bash
+set -e
+cd /tmp
+
+# Install librga prebuilt + headers from airockchip/librga
+if [ ! -f /usr/lib/aarch64-linux-gnu/librga.so ]; then
+    echo "[*] Fetching librga..."
+    git clone --depth=1 https://github.com/airockchip/librga /tmp/librga_src
+    cp /tmp/librga_src/libs/Linux/gcc-aarch64/librga.so /usr/lib/aarch64-linux-gnu/
+    mkdir -p /usr/include/rga
+    cp /tmp/librga_src/include/rga.h \
+       /tmp/librga_src/include/RgaApi.h \
+       /tmp/librga_src/include/RgaUtils.h \
+       /tmp/librga_src/include/drmrga.h \
+       /tmp/librga_src/include/GrallocOps.h \
+       /tmp/librga_src/include/im2d_type.h \
+       /usr/include/rga/
+    ldconfig
+    rm -rf /tmp/librga_src
+fi
+
+# Build rk_hw_base middleware
+if [ ! -f /usr/lib/aarch64-linux-gnu/librk_hw_base.so ]; then
+    echo "[*] Building rk_hw_base..."
+    git clone --depth=1 https://github.com/sujit-168/rk_hw_base /tmp/rk_hw_base
+    cd /tmp/rk_hw_base
+    make
+    cp lib/librk_hw_base.so /usr/lib/aarch64-linux-gnu/
+    ldconfig
+    cd /tmp
+    rm -rf /tmp/rk_hw_base
+fi
+
+# Build rockchip VAAPI driver
+if [ ! -f /usr/lib/aarch64-linux-gnu/dri/rockchip_drv_video.so ]; then
+    echo "[*] Building rockchip_drv_video.so..."
+    git clone --depth=1 https://github.com/sujit-168/rk_vaapi_driver /tmp/rk_vaapi_driver
+    git clone --depth=1 https://github.com/sujit-168/rk_hw_base /tmp/rk_hw_base
+    cd /tmp/rk_vaapi_driver
+    make
+    mkdir -p /usr/lib/aarch64-linux-gnu/dri
+    cp lib/rockchip_drv_video.so /usr/lib/aarch64-linux-gnu/dri/
+    ldconfig
+    cd /tmp
+    rm -rf /tmp/rk_vaapi_driver /tmp/rk_hw_base
+fi
+
+echo "[+] Rockchip VAAPI driver ready."
+BUILD_VAAPI_EOF
+chmod +x "${ROOTFS_MNT}/tmp/build_vaapi.sh"
+chroot "${ROOTFS_MNT}" /tmp/build_vaapi.sh || echo "[!] Warning: VAAPI driver build failed; hardware video decode will not be available."
+rm -f "${ROOTFS_MNT}/tmp/build_vaapi.sh"
+
 echo "[*] Adding Firefox acceleration defaults..."
 mkdir -p "${ROOTFS_MNT}/usr/lib/firefox-esr/defaults/pref"
 FF_VAAPI_ENABLED="false"
@@ -624,7 +683,10 @@ mkdir -p "${ROOTFS_MNT}/etc/chromium.d"
 if [ "${FF_VAAPI_ENABLED}" = "true" ]; then
     cat > "${ROOTFS_MNT}/etc/chromium.d/rk3562-hw-accel" << 'CHROMIUM_HW_FLAGS'
 # RK3562 hardware acceleration — sourced by /usr/bin/chromium wrapper
-CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --use-gl=egl"
+export LIBVA_DRIVER_NAME=rockchip
+export LIBVA_DRIVERS_PATH=/usr/lib/aarch64-linux-gnu/dri
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --ozone-platform=wayland"
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --use-angle=opengles"
 CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --ignore-gpu-blocklist"
 CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --enable-gpu-rasterization"
 CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --enable-zero-copy"
@@ -636,7 +698,8 @@ else
     # so compositing uses Mali rather than llvmpipe.
     cat > "${ROOTFS_MNT}/etc/chromium.d/rk3562-hw-accel" << 'CHROMIUM_EGL_FLAGS'
 # RK3562 EGL/GPU-raster only (no VAAPI driver found at build time)
-CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --use-gl=egl"
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --ozone-platform=wayland"
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --use-angle=opengles"
 CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --ignore-gpu-blocklist"
 CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --enable-gpu-rasterization"
 CHROMIUM_EGL_FLAGS
@@ -760,6 +823,42 @@ cat > "${ROOTFS_MNT}/home/chaos/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-s
 </channel>
 XFCESESSION
 chroot "${ROOTFS_MNT}" chown chaos:chaos /home/chaos/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-session.xml || true
+
+# GTK/icon theme — Adwaita-dark GTK theme + Adwaita icon theme.
+# Both ship in Debian Bookworm (gnome-themes-extra-data / adwaita-icon-theme).
+# Adwaita v43 has clean SVG tray icons: battery levels, wifi bars, bluetooth,
+# volume, brightness — all consistent and sharp.
+mkdir -p "${ROOTFS_MNT}/home/chaos/.config/xfce4/xfconf/xfce-perchannel-xml"
+cat > "${ROOTFS_MNT}/home/chaos/.config/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml" << 'XSETTINGS_XML'
+<?xml version="1.0" encoding="UTF-8"?>
+<channel name="xsettings" version="1.0">
+  <property name="Net" type="empty">
+    <property name="ThemeName"     type="string" value="Adwaita-dark"/>
+    <property name="IconThemeName" type="string" value="Adwaita"/>
+  </property>
+  <property name="Gtk" type="empty">
+    <property name="CursorThemeName" type="string" value="Adwaita"/>
+    <property name="CursorThemeSize" type="int"    value="24"/>
+    <property name="FontName"        type="string" value="Sans 11"/>
+    <property name="MonospaceFontName" type="string" value="Monospace 11"/>
+  </property>
+</channel>
+XSETTINGS_XML
+chroot "${ROOTFS_MNT}" chown chaos:chaos \
+    /home/chaos/.config/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml || true
+
+# GTK3 settings file as fallback for apps that bypass xsettings.
+mkdir -p "${ROOTFS_MNT}/home/chaos/.config/gtk-3.0"
+cat > "${ROOTFS_MNT}/home/chaos/.config/gtk-3.0/settings.ini" << 'GTK3CFG'
+[Settings]
+gtk-theme-name=Adwaita-dark
+gtk-icon-theme-name=Adwaita
+gtk-cursor-theme-name=Adwaita
+gtk-cursor-theme-size=24
+gtk-font-name=Sans 11
+gtk-application-prefer-dark-theme=1
+GTK3CFG
+chroot "${ROOTFS_MNT}" chown -R chaos:chaos /home/chaos/.config/gtk-3.0 || true
 
 # Ensure Wi-Fi/Bluetooth tray applets are launched in XFCE even if package
 # autostart files are missing in this rootfs variant.
@@ -1615,6 +1714,7 @@ bindsym $mod+f      fullscreen toggle
 bindsym $mod+Tab    focus next sibling
 bindsym $mod+Shift+Tab focus prev sibling
 bindsym $mod+Shift+e exec swaymsg exit
+bindsym XF86PowerOff exec /usr/local/bin/rk-power-menu.sh
 
 ### Panel
 bar {
@@ -1630,28 +1730,126 @@ exec mako
 exec sh -c 'command -v squeekboard >/dev/null 2>&1 && exec squeekboard'
 SWAY_CFG
 
-# Touch-friendly power menu — uses wofi dmenu so each option is a large tap
-# target.  Kills any leftover instance before opening to prevent stacking.
+# Touch-friendly power dialog — GTK3, icon buttons, no search bar, no scroll.
+# Replaces the wofi dmenu approach which couldn't reliably hide its search bar.
+cat > "${ROOTFS_MNT}/usr/local/bin/rk-power-dialog.py" << 'RK_POWER_DIALOG'
+#!/usr/bin/env python3
+"""Touch-friendly Wayland power dialog — icon buttons, no search."""
+import gi, subprocess
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk, Gdk
+
+CSS = b"""
+window.power-dialog {
+    background-color: #1c1c1e;
+    border-radius: 14px;
+    border: 1px solid #3a3a3c;
+}
+.btn-action {
+    background: rgba(255,255,255,0.07);
+    color: #f2f2f7;
+    border-radius: 10px;
+    border: 1px solid rgba(255,255,255,0.12);
+    padding: 16px 10px;
+    font-size: 13px;
+    min-width: 120px;
+    min-height: 110px;
+}
+.btn-action:hover  { background: rgba(255,255,255,0.15); }
+.btn-action:active { background: rgba(255,255,255,0.25); }
+.btn-cancel {
+    background: rgba(255,59,48,0.15);
+    color: #ff453a;
+    border-radius: 10px;
+    border: 1px solid rgba(255,59,48,0.28);
+    padding: 12px;
+    font-size: 13px;
+}
+.btn-cancel:hover { background: rgba(255,59,48,0.25); }
+.title-label { color: #ebebf5; font-size: 15px; font-weight: bold; }
+"""
+
+ACTIONS = [
+    ("system-shutdown", "Shut Down", ["systemctl", "poweroff"]),
+    ("system-reboot",   "Restart",   ["systemctl", "reboot"]),
+    ("system-log-out",  "Log Out",   ["swaymsg",   "exit"]),
+]
+
+class PowerDialog(Gtk.Window):
+    def __init__(self):
+        super().__init__()
+        self.get_style_context().add_class("power-dialog")
+        self.set_title("Power")
+        self.set_default_size(480, 300)
+        self.set_position(Gtk.WindowPosition.CENTER)
+        self.set_decorated(False)
+        self.set_keep_above(True)
+        self.set_resizable(False)
+        self.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            self.get_screen(), provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        outer.set_margin_top(24)
+        outer.set_margin_bottom(20)
+        outer.set_margin_start(20)
+        outer.set_margin_end(20)
+        self.add(outer)
+
+        title = Gtk.Label(label="Power Options")
+        title.get_style_context().add_class("title-label")
+        outer.pack_start(title, False, False, 0)
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        row.set_homogeneous(True)
+        outer.pack_start(row, True, True, 0)
+
+        for icon_name, label_text, cmd in ACTIONS:
+            btn = Gtk.Button()
+            btn.get_style_context().add_class("btn-action")
+            content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            content.set_halign(Gtk.Align.CENTER)
+            icon = Gtk.Image.new_from_icon_name(icon_name, Gtk.IconSize.DIALOG)
+            lbl = Gtk.Label(label=label_text)
+            content.pack_start(icon, False, False, 0)
+            content.pack_start(lbl, False, False, 0)
+            btn.add(content)
+            btn.connect("clicked", self.run_cmd, cmd)
+            row.pack_start(btn, True, True, 0)
+
+        cancel = Gtk.Button(label="Cancel")
+        cancel.get_style_context().add_class("btn-cancel")
+        cancel.connect("clicked", lambda *_: Gtk.main_quit())
+        outer.pack_start(cancel, False, False, 0)
+
+        self.connect("delete-event", lambda *_: Gtk.main_quit())
+        self.connect("key-press-event", self.on_key)
+
+    def on_key(self, w, event):
+        if event.keyval == Gdk.KEY_Escape:
+            Gtk.main_quit()
+
+    def run_cmd(self, btn, cmd):
+        subprocess.Popen(cmd)
+        Gtk.main_quit()
+
+win = PowerDialog()
+win.show_all()
+Gtk.main()
+RK_POWER_DIALOG
+chmod +x "${ROOTFS_MNT}/usr/local/bin/rk-power-dialog.py"
+
+# rk-power-menu.sh now just launches the GTK dialog (kills any leftover first).
 cat > "${ROOTFS_MNT}/usr/local/bin/rk-power-menu.sh" << 'RK_POWER_MENU'
 #!/bin/sh
-# Kill any existing power-menu wofi instance to prevent stacking on repeated taps.
-pkill -f "wofi.*rk-power-menu" 2>/dev/null || true
+pkill -f rk-power-dialog.py 2>/dev/null || true
 sleep 0.05
-
-choice=$(printf 'Shutdown\nReboot\nLogout\nCancel' | \
-    wofi --dmenu \
-         --prompt='Power' \
-         --width=320 \
-         --height=240 \
-         --cache-file=/dev/null \
-         --hide-search \
-         2>/dev/null)
-
-case "${choice}" in
-    Shutdown) systemctl poweroff ;;
-    Reboot)   systemctl reboot ;;
-    Logout)   swaymsg exit ;;
-esac
+exec /usr/local/bin/rk-power-dialog.py
 RK_POWER_MENU
 chmod +x "${ROOTFS_MNT}/usr/local/bin/rk-power-menu.sh"
 
