@@ -432,19 +432,21 @@ cat > "${ROOTFS_MNT}/tmp/build_vaapi.sh" << 'BUILD_VAAPI_EOF'
 set -e
 cd /tmp
 
+# Install build dependencies for VAAPI driver
+apt-get install -y --no-install-recommends libva-dev libdrm-dev pkg-config
+
 # Install librga prebuilt + headers from airockchip/librga
 if [ ! -f /usr/lib/aarch64-linux-gnu/librga.so ]; then
     echo "[*] Fetching librga..."
     git clone --depth=1 https://github.com/airockchip/librga /tmp/librga_src
     cp /tmp/librga_src/libs/Linux/gcc-aarch64/librga.so /usr/lib/aarch64-linux-gnu/
+    # Create SONAME symlink if the binary has one embedded
+    SONAME=$(objdump -p /usr/lib/aarch64-linux-gnu/librga.so 2>/dev/null | awk '/SONAME/{print $2}')
+    if [ -n "$SONAME" ] && [ "$SONAME" != "librga.so" ]; then
+        ln -sf librga.so "/usr/lib/aarch64-linux-gnu/$SONAME"
+    fi
     mkdir -p /usr/include/rga
-    cp /tmp/librga_src/include/rga.h \
-       /tmp/librga_src/include/RgaApi.h \
-       /tmp/librga_src/include/RgaUtils.h \
-       /tmp/librga_src/include/drmrga.h \
-       /tmp/librga_src/include/GrallocOps.h \
-       /tmp/librga_src/include/im2d_type.h \
-       /usr/include/rga/
+    cp /tmp/librga_src/include/*.h /usr/include/rga/
     ldconfig
     rm -rf /tmp/librga_src
 fi
@@ -456,16 +458,16 @@ if [ ! -f /usr/lib/aarch64-linux-gnu/librk_hw_base.so ]; then
     cd /tmp/rk_hw_base
     make
     cp lib/librk_hw_base.so /usr/lib/aarch64-linux-gnu/
+    mkdir -p /usr/include/rk_hw_base
+    cp include/*.h /usr/include/rk_hw_base/
     ldconfig
     cd /tmp
-    rm -rf /tmp/rk_hw_base
 fi
 
 # Build rockchip VAAPI driver
 if [ ! -f /usr/lib/aarch64-linux-gnu/dri/rockchip_drv_video.so ]; then
     echo "[*] Building rockchip_drv_video.so..."
     git clone --depth=1 https://github.com/sujit-168/rk_vaapi_driver /tmp/rk_vaapi_driver
-    git clone --depth=1 https://github.com/sujit-168/rk_hw_base /tmp/rk_hw_base
     cd /tmp/rk_vaapi_driver
     make
     mkdir -p /usr/lib/aarch64-linux-gnu/dri
@@ -474,6 +476,9 @@ if [ ! -f /usr/lib/aarch64-linux-gnu/dri/rockchip_drv_video.so ]; then
     cd /tmp
     rm -rf /tmp/rk_vaapi_driver /tmp/rk_hw_base
 fi
+
+# Clean up build-only dependencies
+apt-get purge -y --auto-remove libva-dev libdrm-dev pkg-config 2>/dev/null || true
 
 echo "[+] Rockchip VAAPI driver ready."
 BUILD_VAAPI_EOF
@@ -1864,20 +1869,38 @@ exec /usr/local/bin/rk-power-dialog.py
 RK_POWER_MENU
 chmod +x "${ROOTFS_MNT}/usr/local/bin/rk-power-menu.sh"
 
-# Single-instance app launcher — kills any existing wofi before opening a new one
-# so multiple rapid taps don't stack a dozen launcher windows.
+# App launcher — always kills stale wofi then opens fresh; uses current screen
+# dimensions so it fills the display correctly in both portrait and landscape.
 cat > "${ROOTFS_MNT}/usr/local/bin/rk-launcher.sh" << 'RK_LAUNCHER'
 #!/bin/sh
-if pgrep -x wofi > /dev/null 2>&1; then
-    pkill -x wofi
-    exit 0
+pkill -x wofi 2>/dev/null
+sleep 0.05
+
+# Read current output dimensions from sway
+DIMS=$(SWAYSOCK=$(ls /run/user/1000/sway*.sock 2>/dev/null | head -1) \
+  swaymsg -t get_outputs 2>/dev/null | \
+  python3 -c "import sys,json; o=json.load(sys.stdin)[0]['rect']; print(o['width'], o['height'])" 2>/dev/null)
+
+W=$(echo "$DIMS" | cut -d' ' -f1)
+H=$(echo "$DIMS" | cut -d' ' -f2)
+[ -z "$W" ] && W=800
+[ -z "$H" ] && H=1280
+
+H=$((H - 52))  # subtract waybar height
+
+# Portrait → 3 columns, Landscape → 5 columns
+if [ "$W" -lt "$H" ]; then
+    COLS=3
+else
+    COLS=5
 fi
+
 exec wofi --show drun \
-          --width 800 --height 1280 \
+          --width "$W" --height "$H" \
           --cache-file=/dev/null \
           --no-actions \
           --allow-images \
-          --columns 4 \
+          --columns "$COLS" \
           2>/dev/null
 RK_LAUNCHER
 chmod +x "${ROOTFS_MNT}/usr/local/bin/rk-launcher.sh"
@@ -1935,6 +1958,73 @@ done
 RK_SWAY_STATUS
 chmod +x "${ROOTFS_MNT}/usr/local/bin/rk-swaybar-status.sh"
 
+# Brightness slider — GTK3 popup invoked by the waybar backlight button.
+cat > "${ROOTFS_MNT}/usr/local/bin/rk-brightness-slider.py" << 'RK_BRIGHTNESS_SLIDER'
+#!/usr/bin/env python3
+import gi
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk, Gdk
+import subprocess
+
+def get_brightness_pct():
+    try:
+        cur = int(subprocess.check_output(['brightnessctl', 'get']).strip())
+        mx  = int(subprocess.check_output(['brightnessctl', 'max']).strip())
+        return max(5, int(cur * 100 / mx))
+    except:
+        return 50
+
+def set_brightness(pct):
+    subprocess.Popen(['brightnessctl', 'set', f'{int(pct)}%'],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+win = Gtk.Window()
+win.set_type_hint(Gdk.WindowTypeHint.POPUP_MENU)
+win.set_decorated(False)
+win.set_default_size(500, 64)
+win.set_resizable(False)
+
+css = b"""
+window { background-color: #1a1b26; border: 2px solid #3b4261; border-radius: 8px; }
+label  { color: #b4f9f8; font-size: 18px; }
+scale trough { background-color: #3b4261; border-radius: 4px; min-height: 8px; }
+scale highlight { background-color: #b4f9f8; border-radius: 4px; }
+scale slider { background-color: #c0caf5; border-radius: 12px; min-width: 24px; min-height: 24px; }
+"""
+provider = Gtk.CssProvider()
+provider.load_from_data(css)
+Gtk.StyleContext.add_provider_for_screen(
+    Gdk.Screen.get_default(), provider,
+    Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+box.set_margin_top(12); box.set_margin_bottom(12)
+box.set_margin_start(16); box.set_margin_end(16)
+
+lbl = Gtk.Label(label="☀")
+box.pack_start(lbl, False, False, 0)
+
+adj = Gtk.Adjustment(value=get_brightness_pct(), lower=5, upper=100,
+                     step_increment=5, page_increment=10)
+scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=adj)
+scale.set_digits(0)
+scale.set_value_pos(Gtk.PositionType.RIGHT)
+scale.set_size_request(380, -1)
+
+def on_value_changed(s):
+    set_brightness(s.get_value())
+
+scale.connect('value-changed', on_value_changed)
+box.pack_start(scale, True, True, 0)
+
+win.add(box)
+win.connect('focus-out-event', lambda w, e: Gtk.main_quit())
+win.connect('destroy', Gtk.main_quit)
+win.show_all()
+Gtk.main()
+RK_BRIGHTNESS_SLIDER
+chmod +x "${ROOTFS_MNT}/usr/local/bin/rk-brightness-slider.py"
+
 # waybar configuration (used when waybar is installed)
 mkdir -p "${ROOTFS_MNT}/home/chaos/.config/waybar"
 cat > "${ROOTFS_MNT}/home/chaos/.config/waybar/config" << 'WAYBAR_CFG'
@@ -1945,7 +2035,7 @@ cat > "${ROOTFS_MNT}/home/chaos/.config/waybar/config" << 'WAYBAR_CFG'
     "spacing": 0,
     "modules-left": ["custom/apps", "custom/kbd", "custom/close"],
     "modules-center": ["clock"],
-    "modules-right": ["tray", "backlight", "pulseaudio", "battery", "network", "custom/power"],
+    "modules-right": ["tray", "custom/backlight", "pulseaudio", "battery", "network", "custom/power"],
 
     "custom/apps": {
         "format": "Apps",
@@ -1977,15 +2067,15 @@ cat > "${ROOTFS_MNT}/home/chaos/.config/waybar/config" << 'WAYBAR_CFG'
         "spacing": 10,
         "icon-size": 22
     },
-    "backlight": {
-        "format": "{percent}%☀",
-        "on-scroll-up": "brightnessctl set +5%",
-        "on-scroll-down": "brightnessctl set 5%-",
-        "on-click": "brightnessctl set +10%",
+    "custom/backlight": {
+        "exec": "echo \"$(brightnessctl get | awk '{printf \"%d\", $1 * 100 / 255}')%☀\"",
+        "interval": 5,
+        "on-click": "WAYLAND_DISPLAY=$WAYLAND_DISPLAY /usr/local/bin/rk-brightness-slider.py",
+        "on-click-touch": "WAYLAND_DISPLAY=$WAYLAND_DISPLAY /usr/local/bin/rk-brightness-slider.py",
         "tooltip": false
     },
     "battery": {
-        "bat": "rk817-battery",
+        "bat": "battery",
         "interval": 30,
         "format": "{capacity}%{icon}",
         "format-charging": "{capacity}%+",
@@ -2033,7 +2123,7 @@ window#waybar {
 }
 
 /* Right side modules */
-#clock, #tray, #backlight, #pulseaudio, #battery, #network, #custom-power {
+#clock, #tray, #custom-backlight, #pulseaudio, #battery, #network, #custom-power {
     padding: 0 10px;
     color: #c0caf5;
 }
@@ -2068,12 +2158,18 @@ window#waybar {
 #battery.charging{ color: #73daca; }
 #network         { color: #7dcfff; }
 #pulseaudio      { color: #bb9af7; }
-#backlight       { color: #b4f9f8; }
+#custom-backlight { color: #b4f9f8; }
 #custom-power    { color: #f7768e; font-weight: bold; }
 WAYBAR_CSS
 
-# wofi app launcher config — touch-friendly sizing
+# wofi app launcher config — touch-friendly sizing with large icons
 mkdir -p "${ROOTFS_MNT}/home/chaos/.config/wofi"
+cat > "${ROOTFS_MNT}/home/chaos/.config/wofi/config" << 'WOFI_CONFIG'
+allow_images=true
+image_size=64
+single_click=true
+WOFI_CONFIG
+
 cat > "${ROOTFS_MNT}/home/chaos/.config/wofi/style.css" << 'WOFI_CSS'
 window {
     background-color: #1a1b26;
@@ -2084,13 +2180,13 @@ window {
     color: #c0caf5;
     border: 1px solid #3b4261;
     border-radius: 8px;
-    padding: 14px 16px;
-    font-size: 18px;
-    margin: 12px;
+    padding: 16px 18px;
+    font-size: 20px;
+    margin: 14px;
     caret-color: #7aa2f7;
 }
 #scroll {
-    margin: 0 6px 6px 6px;
+    margin: 0 8px 8px 8px;
 }
 #inner-box {
     background-color: transparent;
@@ -2099,23 +2195,25 @@ window {
     background-color: #1a1b26;
 }
 #entry {
-    padding: 12px 6px;
+    padding: 16px 8px;
     color: #c0caf5;
-    font-size: 13px;
+    font-size: 15px;
     border-radius: 10px;
-    margin: 4px;
+    margin: 6px;
 }
 #entry:selected {
     background-color: #2a2d3e;
     color: #7aa2f7;
 }
 #img {
-    margin-bottom: 6px;
+    margin-bottom: 8px;
+    min-width: 64px;
+    min-height: 64px;
 }
 #text {
     color: inherit;
-    font-size: 13px;
-    margin-top: 4px;
+    font-size: 14px;
+    margin-top: 6px;
 }
 WOFI_CSS
 
