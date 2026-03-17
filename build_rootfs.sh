@@ -433,7 +433,7 @@ set -e
 cd /tmp
 
 # Install build dependencies for VAAPI driver
-apt-get install -y --no-install-recommends git libva-dev libdrm-dev pkg-config
+apt-get install -y --no-install-recommends git build-essential libva-dev libdrm-dev pkg-config
 
 # Install librga prebuilt + headers from airockchip/librga
 if [ ! -f /usr/lib/aarch64-linux-gnu/librga.so ]; then
@@ -481,7 +481,7 @@ if [ ! -f /usr/lib/aarch64-linux-gnu/dri/rockchip_drv_video.so ]; then
 fi
 
 # Clean up build-only dependencies
-apt-get purge -y git libva-dev libdrm-dev pkg-config 2>/dev/null || true
+apt-get purge -y git build-essential libva-dev libdrm-dev pkg-config 2>/dev/null || true
 apt-get autoremove -y 2>/dev/null || true
 
 echo "[+] Rockchip VAAPI driver ready."
