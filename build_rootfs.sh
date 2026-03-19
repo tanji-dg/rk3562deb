@@ -85,7 +85,8 @@ apt-get install -y sudo curl wget nano vim openssh-server network-manager wpasup
     iproute2 iputils-ping dnsutils locales tzdata xfce4-power-manager upower brightnessctl rfkill \
     vainfo vdpauinfo \
     onboard wireless-regdb firmware-brcm80211 \
-    gnome-themes-extra gnome-themes-extra-data adwaita-icon-theme
+    gnome-themes-extra gnome-themes-extra-data adwaita-icon-theme \
+    packagekit flatpak gnome-software appstream
 
 # Remove any Trixie apt source that may be left over from a previous failed
 # build attempt.  Trixie packages require libc6 >= 2.38 which Bookworm does
@@ -144,6 +145,19 @@ for optional_pkg in xfce4-pulseaudio-plugin iio-sensor-proxy; do
     fi
 done
 
+# App store: GNOME Software + Flatpak plugin + Flathub remote.
+# This makes GUI app installs easy in both XFCE and sway (e.g. VS Code).
+if apt-cache show gnome-software-plugin-flatpak >/dev/null 2>&1; then
+    apt-get install -y gnome-software-plugin-flatpak
+else
+    echo "[!] Warning: gnome-software-plugin-flatpak not available; Flatpak apps won't show in the store."
+fi
+if command -v flatpak >/dev/null 2>&1; then
+    flatpak remote-add --if-not-exists flathub \
+        https://flathub.org/repo/flathub.flatpakrepo || \
+        echo "[!] Warning: failed to add Flathub remote."
+fi
+
 # Chromium is often smoother than Firefox on this board for YouTube playback.
 if apt-cache show chromium >/dev/null 2>&1; then
     apt-get install -y chromium
@@ -176,6 +190,7 @@ systemctl enable NetworkManager
 systemctl enable bluetooth
 systemctl enable upower || true
 systemctl enable lightdm
+systemctl enable packagekit || true
 
 # Enable compressed RAM swap to improve responsiveness on 4GB systems.
 cat > /etc/default/zramswap << 'ZRAMCFG'
@@ -1996,6 +2011,89 @@ exec wofi --show drun \
 RK_LAUNCHER
 chmod +x "${ROOTFS_MNT}/usr/local/bin/rk-launcher.sh"
 
+# App Store launcher helper (works from waybar and key bindings).
+cat > "${ROOTFS_MNT}/usr/local/bin/rk-app-store.sh" << 'RK_APP_STORE'
+#!/bin/sh
+set -eu
+
+LOG=/tmp/rk-app-store-click.log
+{
+    printf '=== %s ===\n' "$(date -Is)"
+    printf 'argv0=%s uid=%s user=%s\n' "$0" "$(id -u)" "$(id -un)"
+    printf 'env WAYLAND=%s DISPLAY=%s XDG_RUNTIME_DIR=%s DBUS=%s\n' \
+        "${WAYLAND_DISPLAY:-}" "${DISPLAY:-}" "${XDG_RUNTIME_DIR:-}" "${DBUS_SESSION_BUS_ADDRESS:-}"
+} >> "$LOG" 2>/dev/null || true
+
+find_session_pid() {
+    pgrep -u "$(id -u)" -n waybar 2>/dev/null && return 0
+    pgrep -u "$(id -u)" -n sway 2>/dev/null && return 0
+    pgrep -u "$(id -u)" -n xfce4-panel 2>/dev/null && return 0
+    pgrep -u "$(id -u)" -n xfce4-session 2>/dev/null && return 0
+    return 1
+}
+
+load_session_env() {
+    pid="$1"
+    [ -r "/proc/${pid}/environ" ] || return 1
+
+    while IFS= read -r kv; do
+        [ -n "${kv}" ] && export "${kv}"
+    done <<EOF_ENV
+$(tr '\0' '\n' < "/proc/${pid}/environ" | grep -E '^(WAYLAND_DISPLAY|DISPLAY|XDG_RUNTIME_DIR|DBUS_SESSION_BUS_ADDRESS|SWAYSOCK|XDG_SESSION_TYPE|GDK_BACKEND|QT_QPA_PLATFORM)=' || true)
+EOF_ENV
+}
+
+if [ -z "${WAYLAND_DISPLAY:-}" ] && [ -z "${DISPLAY:-}" ]; then
+    if pid=$(find_session_pid); then
+        load_session_env "$pid" || true
+    fi
+fi
+
+if [ -z "${XDG_RUNTIME_DIR:-}" ]; then
+    export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+fi
+if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -S "${XDG_RUNTIME_DIR}/bus" ]; then
+    export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
+fi
+
+if ! command -v flatpak >/dev/null 2>&1 || ! command -v wofi >/dev/null 2>&1; then
+    # Last fallback when picker stack is unavailable.
+    if command -v gnome-software >/dev/null 2>&1; then
+        nohup gnome-software >/tmp/rk-app-store.log 2>&1 &
+        exit 0
+    fi
+    exit 1
+fi
+
+flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo >/dev/null 2>&1 || true
+
+LIST_FILE=/tmp/rk-flathub-apps.tsv
+flatpak remote-ls --app --columns=application,name flathub > "$LIST_FILE"
+
+CHOICE=$(awk -F'\t' 'NF >= 2 { printf "%s\t%s\n", $2, $1 }' "$LIST_FILE" | sort -f | \
+    wofi --dmenu --prompt "Install app (Flathub)" --insensitive --cache-file=/dev/null --width 900 --height 720)
+
+[ -n "${CHOICE:-}" ] || exit 0
+APP_ID=$(printf '%s' "$CHOICE" | awk -F'\t' '{print $2}')
+if [ -z "${APP_ID:-}" ]; then
+    APP_ID="$CHOICE"
+fi
+
+if flatpak list --app --columns=application | grep -Fxq "$APP_ID"; then
+    nohup flatpak run "$APP_ID" >/tmp/rk-app-store.log 2>&1 &
+    exit 0
+fi
+
+if command -v foot >/dev/null 2>&1; then
+    nohup foot -e sh -lc "flatpak install -y flathub '$APP_ID'; echo; echo 'Done. Press Enter to close.'; read _" >/dev/null 2>&1 &
+else
+    nohup sh -lc "flatpak install -y flathub '$APP_ID'" >/tmp/rk-app-store.log 2>&1 &
+fi
+
+exit 0
+RK_APP_STORE
+chmod +x "${ROOTFS_MNT}/usr/local/bin/rk-app-store.sh"
+
 # Close action button helper:
 # - If app launcher is open, close launcher.
 # - Otherwise close focused app/window.
@@ -2284,7 +2382,7 @@ cat > "${ROOTFS_MNT}/home/chaos/.config/waybar/config" << 'WAYBAR_CFG'
     "position": "top",
     "height": 52,
     "spacing": 0,
-    "modules-left": ["custom/apps", "custom/wallpaper", "custom/kbd", "custom/close"],
+    "modules-left": ["custom/apps", "custom/store", "custom/wallpaper", "custom/kbd", "custom/close"],
     "modules-center": ["clock"],
     "modules-right": ["tray", "custom/bluetooth", "custom/backlight", "pulseaudio", "battery", "network", "custom/power"],
 
@@ -2294,6 +2392,13 @@ cat > "${ROOTFS_MNT}/home/chaos/.config/waybar/config" << 'WAYBAR_CFG'
         "on-click-touch": "/usr/local/bin/rk-launcher.sh",
         "tooltip": false,
         "min-width": 70
+    },
+    "custom/store": {
+        "format": "Store",
+        "on-click": "/usr/local/bin/rk-app-store.sh",
+        "on-click-touch": "/usr/local/bin/rk-app-store.sh",
+        "tooltip": false,
+        "min-width": 76
     },
     "custom/wallpaper": {
         "format": "Wall",
@@ -2394,7 +2499,7 @@ window#waybar {
 }
 
 /* Left action buttons — pill style, clearly separated */
-#custom-apps, #custom-wallpaper, #custom-kbd, #custom-close {
+#custom-apps, #custom-store, #custom-wallpaper, #custom-kbd, #custom-close {
     padding: 6px 16px;
     margin: 6px 4px;
     border-radius: 8px;
@@ -2403,11 +2508,13 @@ window#waybar {
 }
 
 #custom-apps  { background-color: #3d59a1; color: #c0caf5; }
+#custom-store { background-color: #5d6931; color: #d6f2a0; }
 #custom-wallpaper { background-color: #5c4d8e; color: #c0caf5; }
 #custom-kbd   { background-color: #33635c; color: #c0caf5; }
 #custom-close { background-color: #8c3a4a; color: #c0caf5; }
 
 #custom-apps:hover  { background-color: #4e6ab5; }
+#custom-store:hover { background-color: #70823b; }
 #custom-wallpaper:hover { background-color: #6f5fa8; }
 #custom-kbd:hover   { background-color: #3d7a72; }
 #custom-close:hover { background-color: #a34555; }
