@@ -1643,12 +1643,16 @@ static void rk817_bat_not_first_pwron(struct rk817_battery_device *battery)
 	} else if (battery->is_ocv_calib) {
 		/* not initialized and poweroff_cnt above 30 min */
 		ocv_vol = rk817_bat_get_ocv_voltage(battery);
-		ocv_soc = rk817_bat_vol_to_soc(battery, ocv_vol);
+		/*
+		 * dsoc/pre_soc are tracked in 0.001% units, so convert the
+		 * OCV-derived SOC into the same unit before comparing.
+		 */
+		ocv_soc = rk817_bat_vol_to_soc(battery, ocv_vol) * 1000;
 		ocv_cap = rk817_bat_vol_to_cap(battery, ocv_vol);
 		pre_cap = ocv_cap;
 		battery->ocv_pre_dsoc = pre_soc;
 		battery->ocv_new_dsoc = ocv_soc;
-		if (abs(ocv_soc - pre_soc) >= battery->pdata->max_soc_offset) {
+		if (abs(ocv_soc - pre_soc) >= battery->pdata->max_soc_offset * 1000) {
 			battery->ocv_pre_dsoc = pre_soc;
 			battery->ocv_new_dsoc = ocv_soc;
 			battery->is_max_soc_offset = true;
@@ -1659,11 +1663,11 @@ static void rk817_bat_not_first_pwron(struct rk817_battery_device *battery)
 		BAT_INFO("OCV calib: cap=%d, rsoc=%d\n", ocv_cap, ocv_soc);
 	} else if (battery->pwroff_min > 0) {
 		ocv_vol = rk817_bat_get_ocv_voltage(battery);
-		ocv_soc = rk817_bat_vol_to_soc(battery, ocv_vol);
+		ocv_soc = rk817_bat_vol_to_soc(battery, ocv_vol) * 1000;
 		ocv_cap = rk817_bat_vol_to_cap(battery, ocv_vol);
 		battery->force_pre_dsoc = pre_soc;
 		battery->force_new_dsoc = ocv_soc;
-		if (abs(ocv_soc - pre_soc) >= 80) {
+		if (abs(ocv_soc - pre_soc) >= 80 * 1000) {
 			battery->is_force_calib = true;
 			BAT_INFO("dsoc force calib: %d -> %d\n",
 				 pre_soc, ocv_soc);

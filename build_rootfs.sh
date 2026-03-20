@@ -2828,6 +2828,25 @@ if ! command -v i2cset >/dev/null 2>&1; then
     exit 0
 fi
 
+resolve_i2c_bus() {
+    for dev in /sys/bus/i2c/devices/*-0020; do
+        [ -e "${dev}" ] || continue
+        bus="${dev##*/}"
+        bus="${bus%-0020}"
+        [ -n "${bus}" ] && {
+            echo "${bus}"
+            return 0
+        }
+    done
+
+    [ -e /dev/i2c-0 ] && {
+        echo "0"
+        return 0
+    }
+
+    return 1
+}
+
 if [ ! -f "${CAP_FILE}" ] || [ ! -f "${VOLT_FILE}" ]; then
     say "battery sysfs missing, skipping"
     exit 0
@@ -2851,11 +2870,40 @@ if [ "${volt}" -lt 3600000 ] && ! is_power_online; then
     exit 0
 fi
 
-say "detected possible stuck gauge (capacity=0 voltage_now=${volt}uV), applying i2cset"
-i2cset -f -y 0 0x20 0x57 0x51 >/dev/null 2>&1 || {
-    say "i2cset command failed"
+i2c_bus="$(resolve_i2c_bus || true)"
+if [ -z "${i2c_bus}" ]; then
+    say "could not locate RK817 i2c bus, skipping"
     exit 0
-}
+fi
+
+say "detected possible stuck gauge (capacity=0 voltage_now=${volt}uV), applying fix on i2c-${i2c_bus}"
+if command -v i2cget >/dev/null 2>&1; then
+    gg_sts_raw="$(i2cget -f -y "${i2c_bus}" 0x20 0x57 2>/dev/null || true)"
+    case "${gg_sts_raw}" in
+        0x[0-9a-fA-F]|0x[0-9a-fA-F][0-9a-fA-F])
+            gg_sts_new_dec=$((gg_sts_raw | 0x10))
+            gg_sts_new_hex="$(printf '0x%02x' "${gg_sts_new_dec}")"
+            i2cset -f -y "${i2c_bus}" 0x20 0x57 "${gg_sts_new_hex}" >/dev/null 2>&1 || {
+                say "i2cset command failed"
+                exit 0
+            }
+            say "GG_STS ${gg_sts_raw} -> ${gg_sts_new_hex} (set BAT_CON)"
+            ;;
+        *)
+            say "GG_STS read failed (${gg_sts_raw}), falling back to legacy write 0x51"
+            i2cset -f -y "${i2c_bus}" 0x20 0x57 0x51 >/dev/null 2>&1 || {
+                say "i2cset command failed"
+                exit 0
+            }
+            ;;
+    esac
+else
+    say "i2cget not found, using legacy write 0x51"
+    i2cset -f -y "${i2c_bus}" 0x20 0x57 0x51 >/dev/null 2>&1 || {
+        say "i2cset command failed"
+        exit 0
+    }
+fi
 
 # Nudge power_supply userspace updates.
 udevadm trigger --subsystem-match=power_supply --action=change >/dev/null 2>&1 || true
@@ -2863,7 +2911,11 @@ sleep 1
 
 new_cap="$(read_int_file "${CAP_FILE}")"
 [ -z "${new_cap}" ] && new_cap=0
-say "after fix: capacity=${new_cap}%"
+if [ "${new_cap}" -eq 0 ]; then
+    say "after fix: capacity still 0% (BAT_CON will take effect on next reboot)"
+else
+    say "after fix: capacity=${new_cap}%"
+fi
 
 exit 0
 RK_BAT_GAUGE_FIX
