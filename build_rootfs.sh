@@ -100,9 +100,10 @@ apt-get update -qq
 # swaybg:   wallpaper setter.
 # wofi:     Wayland-native app launcher (replaces rofi/dmenu for touch).
 # jq:       JSON parsing used by the rotation tray app (swaymsg output).
-# xwayland: keep enabled for compatibility with legacy X11 desktop apps.
+# xwayland: compatibility fallback for apps that still need X11.
+# xdg-desktop-portal: portal backend used by Flatpak apps under Wayland.
 # foot: Wayland-native terminal (still preferred).
-apt-get install -y sway swaybg wofi jq foot mako-notifier
+apt-get install -y sway swaybg wofi jq foot mako-notifier xwayland xdg-desktop-portal
 
 # wvkbd: Wayland-native on-screen keyboard (wlroots virtual-keyboard protocol).
 # Replaces onboard (X11-only) in the Sway session.
@@ -117,7 +118,7 @@ for optional_pkg in wvkbd squeekboard; do
 done
 
 # Optional Wayland tools — install if available in Bookworm, skip otherwise.
-for optional_pkg in waybar grim slurp wlr-randr; do
+for optional_pkg in waybar grim slurp wlr-randr xdg-desktop-portal-wlr xdg-desktop-portal-gtk; do
     # Check exact Bookworm version to avoid accidentally pulling Trixie builds
     # that sneak in via a dirty apt cache.
     pkg_ver=$(apt-cache policy "${optional_pkg}" 2>/dev/null \
@@ -1719,6 +1720,7 @@ export QT_QPA_PLATFORM="wayland;xcb"
 export SDL_VIDEODRIVER=wayland
 export MOZ_ENABLE_WAYLAND=1
 export MOZ_DISABLE_RDD_SANDBOX=1
+export ELECTRON_OZONE_PLATFORM_HINT=wayland
 export _JAVA_AWT_WM_NONREPARENTING=1
 exec sway
 RK_SWAY_SESSION
@@ -1757,8 +1759,8 @@ set $menu /usr/local/bin/rk-launcher.sh
 set $kbd  /usr/local/bin/rk-keyboard-toggle.sh
 set $wall /usr/local/bin/rk-wallpaper-picker.py
 
-### Disable Xwayland — Mali glamor crashes under Xwayland (same as X11)
-xwayland disable
+### Keep Xwayland enabled as compatibility fallback for X11/Electron apps.
+xwayland enable
 
 ### Output — 800×1280 portrait panel; default landscape = 90° CW
 # rk-screen-rotate.py will update this at runtime; setting it here avoids
@@ -2079,15 +2081,22 @@ if [ -z "${APP_ID:-}" ]; then
     APP_ID="$CHOICE"
 fi
 
+apply_wayland_overrides() {
+    app="$1"
+    # Safe no-op for non-Electron apps; helps Electron Flatpaks on sway.
+    flatpak override --user --env=ELECTRON_OZONE_PLATFORM_HINT=wayland "$app" >/dev/null 2>&1 || true
+}
+
 if flatpak list --app --columns=application | grep -Fxq "$APP_ID"; then
+    apply_wayland_overrides "$APP_ID"
     nohup flatpak run "$APP_ID" >/tmp/rk-app-store.log 2>&1 &
     exit 0
 fi
 
 if command -v foot >/dev/null 2>&1; then
-    nohup foot -e sh -lc "flatpak install -y flathub '$APP_ID'; echo; echo 'Done. Press Enter to close.'; read _" >/dev/null 2>&1 &
+    nohup foot -e sh -lc "flatpak install -y flathub '$APP_ID'; flatpak override --user --env=ELECTRON_OZONE_PLATFORM_HINT=wayland '$APP_ID' >/dev/null 2>&1 || true; echo; echo 'Done. Press Enter to close.'; read _" >/dev/null 2>&1 &
 else
-    nohup sh -lc "flatpak install -y flathub '$APP_ID'" >/tmp/rk-app-store.log 2>&1 &
+    nohup sh -lc "flatpak install -y flathub '$APP_ID'; flatpak override --user --env=ELECTRON_OZONE_PLATFORM_HINT=wayland '$APP_ID' >/dev/null 2>&1 || true" >/tmp/rk-app-store.log 2>&1 &
 fi
 
 exit 0
