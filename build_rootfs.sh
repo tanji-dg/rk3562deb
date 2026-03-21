@@ -283,19 +283,56 @@ if [ -d "${ROOT_DIR}/debs" ]; then
     if compgen -G "${ROOT_DIR}/debs/*.deb" > /dev/null; then
         mkdir -p "${ROOTFS_MNT}/tmp/debs"
         cp "${ROOT_DIR}/debs"/*.deb "${ROOTFS_MNT}/tmp/debs/"
-        chroot "${ROOTFS_MNT}" bash -c 'dpkg -i /tmp/debs/*.deb || apt-get -f install -y' 2>/dev/null || true
+        chroot "${ROOTFS_MNT}" bash -c '
+set -e
+dpkg -i /tmp/debs/*.deb || apt-get -f install -y
+
+# Prefer a Wayland-capable Mali userspace package when one is provided locally.
+wayland_mali_deb=""
+for candidate in /tmp/debs/libmali*-x11-wayland-gbm*.deb /tmp/debs/libmali*-wayland-gbm*.deb; do
+    [ -e "${candidate}" ] || continue
+    wayland_mali_deb="${candidate}"
+    break
+done
+if [ -n "${wayland_mali_deb}" ]; then
+    dpkg -i "${wayland_mali_deb}" || apt-get -f install -y
+fi
+
+# If both variants exist, drop x11-only Mali to avoid selecting the wrong EGL stack.
+mali_pkgs="$(dpkg -l | awk '"'"'/^ii/ && $2 ~ /^libmali-/ {print $2}'"'"')"
+if echo "${mali_pkgs}" | grep -Eq "(x11-wayland-gbm|wayland-gbm)$"; then
+    x11_only_pkgs="$(echo "${mali_pkgs}" | grep -E "x11-gbm$" | grep -v "x11-wayland-gbm" || true)"
+    if [ -n "${x11_only_pkgs}" ]; then
+        apt-get purge -y ${x11_only_pkgs} || true
+        apt-get -f install -y || true
+    fi
+fi
+' 2>/dev/null || true
         rm -rf "${ROOTFS_MNT}/tmp/debs"
     else
         echo "[!] Warning: No .deb files found in ${ROOT_DIR}/debs"
     fi
 fi
 
-# 5b. Prefer Mali EGL/GBM from the installed libmali package over Mesa shims.
+# 5b. Keep Mesa EGL fallback, and make Mali GBM path use Debian libgbm.
+# Some Mali blobs ship an old libgbm missing gbm_bo_create_with_modifiers2,
+# which causes Plasma Wayland login loops.
 if compgen -G "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/mali/libmali*.so" > /dev/null; then
-    echo "[*] Removing conflicting Mesa EGL/GBM files..."
-    rm -f "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/libEGL_mesa.so.0"*
-    rm -f "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/libgbm.so.1"*
-    rm -f "${ROOTFS_MNT}/usr/share/glvnd/egl_vendor.d/50_mesa.json"
+    echo "[*] Preserving Mesa EGL fallback and fixing Mali libgbm path..."
+
+    # Force the Mali libgbm path to resolve to Debian's libgbm implementation.
+    if [ -e "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/libgbm.so.1" ]; then
+        if [ -e "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/mali/libgbm.so.1" ] && \
+           [ ! -e "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/mali/libgbm.so.1.rkbak" ]; then
+            cp -a "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/mali/libgbm.so.1" \
+                  "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/mali/libgbm.so.1.rkbak"
+        fi
+        ln -sfn /usr/lib/aarch64-linux-gnu/libgbm.so.1 \
+                "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/mali/libgbm.so.1"
+        ln -sfn libgbm.so.1 \
+                "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/mali/libgbm.so"
+    fi
+
     chroot "${ROOTFS_MNT}" ldconfig
 else
     echo "[!] Warning: Mali userspace package not detected; skipping Mesa cleanup."
@@ -705,52 +742,39 @@ chroot "${ROOTFS_MNT}" plymouth-set-default-theme rkdebian 2>/dev/null || \
     echo "[!] Warning: could not set Plymouth theme; 'spinner' will be used"
 
 # Add Chromium hardware acceleration flags.
-# This Chromium build only allows ANGLE-based GL backends; --use-gl=egl
-# (native GLES) is not in the allowed list. We use --use-angle=opengles which
-# routes ANGLE through the Mali GBM GLES driver for hardware GPU compositing.
-# --use-gl=angle --use-angle=opengles   : ANGLE via Mali GBM GLES driver
-# --ignore-gpu-blocklist                 : allow GPU rasterization on Mali
-# --enable-gpu-rasterization             : tile rasterization via GLES
-# --disable-gpu-sandbox                  : VAAPI driver needs /dev/mpp_service
-# --enable-accelerated-video-decode      : opt-in for HW video decode
-# VaapiVideoDecoder                      : VAAPI H.264/HEVC decode path
-# VaapiIgnoreDriverChecks               : bypass Chromium driver name allowlist
-# UseChromeOSDirectVideoDecoder disabled : use standard Linux VAAPI, not CrOS
 echo "[*] Adding Chromium acceleration flags..."
 mkdir -p "${ROOTFS_MNT}/etc/chromium.d"
 if [ "${FF_VAAPI_ENABLED}" = "true" ]; then
     cat > "${ROOTFS_MNT}/etc/chromium.d/rk3562-hw-accel" << 'CHROMIUM_HW_FLAGS'
 # RK3562 hardware acceleration — sourced by /usr/bin/chromium wrapper
-# ANGLE backed by Mali GLES (angle=opengles) for GPU compositing.
+# Native Mali EGL (wayland-gbm platform) for GPU compositing.
 # VAAPI hardware video decode via rockchip_drv_video.so + MPP.
-# Note: --use-gl=egl (native EGL) is not in the allowed list for this build;
-# --use-angle=opengles routes ANGLE through the Mali GBM GLES driver instead.
 export LIBVA_DRIVER_NAME=rockchip
 export LIBVA_DRIVERS_PATH=/usr/lib/aarch64-linux-gnu/dri
 CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --ozone-platform=wayland"
-CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --use-gl=angle"
-CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --use-angle=opengles"
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --use-gl=egl"
 CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --ignore-gpu-blocklist"
 CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --enable-gpu-rasterization"
 CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --disable-gpu-sandbox"
 CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --enable-accelerated-video-decode"
 CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --enable-features=VaapiVideoDecoder,VaapiVideoDecodeLinuxGL,VaapiIgnoreDriverChecks"
 CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --disable-features=UseChromeOSDirectVideoDecoder"
-# ── FALLBACK: if Mali GLES crashes, replace --use-angle=opengles with: ──
-# CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --use-angle=swiftshader"
+# ── FALLBACK: if --use-gl=egl crashes, try ANGLE instead: ──
+# CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --use-gl=angle"
+# CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --use-angle=opengles"
 CHROMIUM_HW_FLAGS
 else
-    # No rockchip VAAPI driver — ANGLE/Mali GLES compositing, software video decode.
+    # No rockchip VAAPI driver — native Mali EGL compositing, software video decode.
     cat > "${ROOTFS_MNT}/etc/chromium.d/rk3562-hw-accel" << 'CHROMIUM_SW_FLAGS'
-# RK3562 — ANGLE/Mali GLES compositing, software video decode
+# RK3562 — Native Mali EGL compositing, software video decode
 # (VAAPI driver not found at build time)
 CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --ozone-platform=wayland"
-CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --use-gl=angle"
-CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --use-angle=opengles"
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --use-gl=egl"
 CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --ignore-gpu-blocklist"
 CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --enable-gpu-rasterization"
-# ── FALLBACK: if Mali GLES crashes, replace --use-angle=opengles with: ──
-# CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --use-angle=swiftshader"
+# ── FALLBACK: if --use-gl=egl crashes, try ANGLE instead: ──
+# CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --use-gl=angle"
+# CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --use-angle=opengles"
 CHROMIUM_SW_FLAGS
 fi
 
