@@ -478,12 +478,10 @@ cat > "${ROOTFS_MNT}/etc/X11/xorg.conf.d/20-modesetting-rockchip.conf" << 'XORG_
 Section "Device"
     Identifier "Rockchip Graphics"
     Driver "modesetting"
-    # glamor is enabled for 2D acceleration.
-    # NOTE: xrandr --rotate crashes the X server with the Mali BSP blob because
-    # glamor's shadow-framebuffer rotation path is incompatible with this driver.
-    # Screen rotation on X11 is intentionally disabled in the tray app; use a
-    # Wayland session for smooth, crash-free rotation instead.
-    Option "AccelMethod" "glamor"
+    # Keep X11 on the non-glamor path for stability with this Mali userspace.
+    # We observed intermittent SDDM black-screen boots where Xorg crashed in
+    # libmali while modesetting+glamor initialized eglGetDisplay().
+    Option "AccelMethod" "none"
     Option "DRI" "3"
 EndSection
 XORG_GPU
@@ -883,6 +881,32 @@ Hidden=true
 MALIIT_KEYBOARD_HIDE
 chroot "${ROOTFS_MNT}" chown chaos:chaos /home/chaos/.config/autostart/onboard.desktop \
     /home/chaos/.config/autostart/maliit-keyboard.desktop || true
+
+# Trim background autostarts that are unnecessary in the Plasma tablet image.
+# These either belong to other desktops (XFCE/GNOME) or are optional daemons
+# that cost responsiveness on software-rendered Plasma X11.
+PLASMA_DISABLE_AUTOSTARTS="
+ayatana-indicator-application.desktop
+blueman.desktop
+geoclue-demo-agent.desktop
+kup-daemon.desktop
+light-locker.desktop
+org.gnome.Software.desktop
+print-applet.desktop
+rk-xfce4-panel.desktop
+xfce4-notifyd.desktop
+xfce4-power-manager.desktop
+xfsettingsd.desktop
+xiccd.desktop
+"
+
+for desktop in ${PLASMA_DISABLE_AUTOSTARTS}; do
+cat > "${ROOTFS_MNT}/home/chaos/.config/autostart/${desktop}" << 'AUTOSTART_HIDE'
+[Desktop Entry]
+Hidden=true
+AUTOSTART_HIDE
+chroot "${ROOTFS_MNT}" chown chaos:chaos "/home/chaos/.config/autostart/${desktop}" || true
+done
 
 # Keep a fallback polkit agent autostart for Plasma sessions.
 mkdir -p "${ROOTFS_MNT}/etc/xdg/autostart"
