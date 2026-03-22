@@ -498,9 +498,12 @@ cat > "${ROOTFS_MNT}/etc/X11/xorg.conf.d/20-modesetting-rockchip.conf" << 'XORG_
 Section "Device"
     Identifier "Rockchip Graphics"
     Driver "modesetting"
-    # Keep X11 on the non-glamor path for stability with this Mali userspace.
-    # This avoids post-login AIGLX failures that drop Plasma to llvmpipe.
-    Option "AccelMethod" "none"
+    # glamor is enabled for 2D acceleration.
+    # NOTE: xrandr --rotate crashes the X server with the Mali BSP blob because
+    # glamor's shadow-framebuffer rotation path is incompatible with this driver.
+    # Screen rotation on X11 is intentionally disabled in the tray app; use a
+    # Wayland session for smooth, crash-free rotation instead.
+    Option "AccelMethod" "glamor"
     Option "DRI" "3"
 EndSection
 XORG_GPU
@@ -821,16 +824,6 @@ rm -f "${ROOTFS_MNT}/home/chaos/.config/environment.d/90-plasma-x11.conf" \
       "${ROOTFS_MNT}/home/chaos/.config/plasma-org.kde.plasma.desktop-appletsrc" \
       "${ROOTFS_MNT}/home/chaos/.config/plasmashellrc"
 
-# Plasma/KWin defaults:
-# Disable compositing by default on X11 to avoid software-rendering regressions
-# when AIGLX/GLX falls back to llvmpipe on this device stack.
-mkdir -p "${ROOTFS_MNT}/home/chaos/.config"
-cat > "${ROOTFS_MNT}/home/chaos/.config/kwinrc" << 'KWINRC_USER'
-[Compositing]
-Enabled=false
-KWINRC_USER
-chmod 0600 "${ROOTFS_MNT}/home/chaos/.config/kwinrc"
-chroot "${ROOTFS_MNT}" chown chaos:chaos /home/chaos/.config/kwinrc || true
 # Prefer Plasma X11 by default.
 PLASMA_SESSION="plasma.desktop"
 PLASMA_DISPLAY_SERVER="x11"
