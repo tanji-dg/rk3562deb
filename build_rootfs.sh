@@ -17,6 +17,13 @@ MODULES_DIR="${OUT_DIR}/modules_staging/lib/modules"
 
 echo "[*] Building Debian 12 Bookworm arm64 rootfs..."
 
+# Optional: force a fresh debootstrap rootfs to avoid stale package/config
+# carry-over across iterative builds.
+if [ "${RKDEBIAN_FORCE_CLEAN_ROOTFS:-0}" = "1" ]; then
+    echo "[*] RKDEBIAN_FORCE_CLEAN_ROOTFS=1 -> removing existing rootfs tree..."
+    rm -rf "${ROOTFS_MNT}"
+fi
+
 # 1. Run debootstrap
 if [ ! -f "${ROOTFS_MNT}/etc/debian_version" ]; then
     echo "[*] Cleaning old rootfs..."
@@ -34,6 +41,7 @@ if [ ! -f "${ROOTFS_MNT}/etc/debian_version" ]; then
     chroot "${ROOTFS_MNT}" /debootstrap/debootstrap --second-stage
 else
     echo "[*] Existing Debian 12 rootfs found. Skipping debootstrap..."
+    echo "[*] Tip: set RKDEBIAN_FORCE_CLEAN_ROOTFS=1 for a fully fresh rebuild."
 fi
 
 # 2. Setup chroot mounts
@@ -72,21 +80,21 @@ APT_SOURCES
 apt-get update
 apt-get install -y sudo curl wget nano vim openssh-server network-manager wpasupplicant iw wireless-tools \
     network-manager-gnome bluez blueman policykit-1-gnome \
-    xorg xserver-xorg xserver-xorg-input-libinput xfce4 xfce4-terminal firefox-esr mesa-utils libgl1-mesa-dri mesa-vulkan-drivers \
+    xorg xserver-xorg xserver-xorg-input-libinput firefox-esr mesa-utils libgl1-mesa-dri mesa-vulkan-drivers \
     pulseaudio pulseaudio-utils pulseaudio-module-bluetooth pavucontrol alsa-utils libasound2-plugins \
     zram-tools \
     plymouth plymouth-themes \
     libegl1 libgles2 libgbm1 libva2 libva-drm2 ffmpeg dbus \
-    udev evtest lightdm pciutils usbutils \
+    udev evtest sddm pciutils usbutils \
     xinput libinput-tools \
     python3 python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 \
     qt6-wayland \
     i2c-tools \
-    iproute2 iputils-ping dnsutils locales tzdata xfce4-power-manager upower brightnessctl rfkill \
+    iproute2 iputils-ping dnsutils locales tzdata upower brightnessctl rfkill \
     vainfo vdpauinfo \
-    onboard wireless-regdb firmware-brcm80211 \
+    wireless-regdb firmware-brcm80211 \
     gnome-themes-extra gnome-themes-extra-data adwaita-icon-theme \
-    packagekit flatpak gnome-software appstream
+    packagekit flatpak appstream xdg-desktop-portal
 
 # Remove any Trixie apt source that may be left over from a previous failed
 # build attempt.  Trixie packages require libc6 >= 2.38 which Bookworm does
@@ -95,30 +103,35 @@ rm -f "${ROOTFS_MNT}/etc/apt/sources.list.d/trixie.list"
 rm -f "${ROOTFS_MNT}/etc/apt/preferences.d/99-trixie-pin"
 apt-get update -qq
 
-# Wayland compositor stack — all from Debian Bookworm (no external repos).
-# sway:     wlroots compositor, Wayland alternative to XFCE.
-# swaybg:   wallpaper setter.
-# wofi:     Wayland-native app launcher (replaces rofi/dmenu for touch).
-# jq:       JSON parsing used by the rotation tray app (swaymsg output).
-# xwayland: compatibility fallback for apps that still need X11.
-# xdg-desktop-portal: portal backend used by Flatpak apps under Wayland.
-# foot: Wayland-native terminal (still preferred).
-apt-get install -y sway swaybg wofi jq foot mako-notifier xwayland xdg-desktop-portal
+# Plasma Wayland stack.
+# Prefer Plasma Mobile where available; fall back to Plasma Desktop.
+apt-get install -y plasma-workspace-wayland kwin-wayland
 
-# wvkbd: Wayland-native on-screen keyboard (wlroots virtual-keyboard protocol).
-# Replaces onboard (X11-only) in the Sway session.
-# squeekboard: OSK that uses the input-method-v1 protocol — auto-shows when a
-# text field gains focus in GTK/Qt apps.  Not in Bookworm stable; skip if absent.
-for optional_pkg in wvkbd squeekboard; do
-    if apt-get install -y "${optional_pkg}" 2>/dev/null; then
-        echo "[+] Installed ${optional_pkg}"
-    else
-        echo "[!] ${optional_pkg} not in Bookworm — skipping"
+plasma_shell_installed=0
+for session_pkg in plasma-mobile plasma-phone-components plasma-desktop; do
+    if apt-cache show "${session_pkg}" >/dev/null 2>&1; then
+        apt-get install -y "${session_pkg}"
+        plasma_shell_installed=1
+        [ "${session_pkg}" != "plasma-mobile" ] && \
+            echo "[!] Warning: ${session_pkg} installed (plasma-mobile unavailable on this mirror)."
+        break
     fi
 done
+if [ "${plasma_shell_installed}" -ne 1 ]; then
+    echo "[-] Error: no Plasma shell package available (tried plasma-mobile/plasma-phone-components/plasma-desktop)."
+    exit 1
+fi
 
-# Optional Wayland tools — install if available in Bookworm, skip otherwise.
-for optional_pkg in waybar grim slurp wlr-randr xdg-desktop-portal-wlr xdg-desktop-portal-gtk; do
+# Optional Plasma/Mobile helpers.
+# Include Qt virtual keyboard packages so SDDM can show an on-screen keyboard
+# before login on touch-only devices.
+for optional_pkg in plasma-nm plasma-pa plasma-discover plasma-discover-backend-flatpak \
+                    xdg-desktop-portal-kde maliit-framework maliit-keyboard \
+                    maliit-inputcontext-qt5 maliit-inputcontext-qt6 \
+                    maliit-inputcontext-gtk3 maliit-inputcontext-gtk2 \
+                    qtvirtualkeyboard-plugin \
+                    qml-module-qtquick-virtualkeyboard \
+                    qml6-module-qtquick-virtualkeyboard xwayland iio-sensor-proxy; do
     # Check exact Bookworm version to avoid accidentally pulling Trixie builds
     # that sneak in via a dirty apt cache.
     pkg_ver=$(apt-cache policy "${optional_pkg}" 2>/dev/null \
@@ -131,32 +144,16 @@ for optional_pkg in waybar grim slurp wlr-randr xdg-desktop-portal-wlr xdg-deskt
     fi
 done
 
-# Install one tray-indicator plugin if available on this Debian mirror.
-for optional_pkg in xfce4-statusnotifier-plugin xfce4-indicator-plugin; do
-    if apt-cache show "${optional_pkg}" >/dev/null 2>&1; then
-        apt-get install -y "${optional_pkg}"
-        break
-    fi
-done
-
-# Install optional desktop helpers when available.
-for optional_pkg in xfce4-pulseaudio-plugin iio-sensor-proxy; do
-    if apt-cache show "${optional_pkg}" >/dev/null 2>&1; then
-        apt-get install -y "${optional_pkg}"
-    fi
-done
-
-# App store: GNOME Software + Flatpak plugin + Flathub remote.
-# This makes GUI app installs easy in both XFCE and sway (e.g. VS Code).
-if apt-cache show gnome-software-plugin-flatpak >/dev/null 2>&1; then
-    apt-get install -y gnome-software-plugin-flatpak
-else
-    echo "[!] Warning: gnome-software-plugin-flatpak not available; Flatpak apps won't show in the store."
-fi
+# App store: Discover + Flatpak backend + Flathub remote.
 if command -v flatpak >/dev/null 2>&1; then
     flatpak remote-add --if-not-exists flathub \
         https://flathub.org/repo/flathub.flatpakrepo || \
         echo "[!] Warning: failed to add Flathub remote."
+fi
+if apt-cache show plasma-discover-backend-flatpak >/dev/null 2>&1; then
+    apt-get install -y plasma-discover-backend-flatpak
+else
+    echo "[!] Warning: plasma-discover-backend-flatpak not available; Flatpak apps won't show in Discover."
 fi
 
 # Chromium is often smoother than Firefox on this board for YouTube playback.
@@ -190,7 +187,10 @@ echo "root:root" | chpasswd
 systemctl enable NetworkManager
 systemctl enable bluetooth
 systemctl enable upower || true
-systemctl enable lightdm
+# Reused rootfs trees may still point display-manager.service to LightDM.
+# Drop the stale link so enabling SDDM can recreate it.
+rm -f /etc/systemd/system/display-manager.service
+systemctl enable sddm
 systemctl enable packagekit || true
 
 # Enable compressed RAM swap to improve responsiveness on 4GB systems.
@@ -268,14 +268,6 @@ if [ -e "${ROOTFS_MNT}/usr/bin/su" ]; then
     chroot "${ROOTFS_MNT}" chown root:root /usr/bin/su || true
     chroot "${ROOTFS_MNT}" chmod 4755 /usr/bin/su || true
 fi
-for helper in /usr/sbin/xfpm-power-backlight-helper \
-              /usr/libexec/xfpm-power-backlight-helper \
-              /usr/lib/xfce4/xfpm-power-backlight-helper; do
-    if [ -e "${ROOTFS_MNT}${helper}" ]; then
-        chroot "${ROOTFS_MNT}" chown root:root "${helper}" || true
-        chroot "${ROOTFS_MNT}" chmod 4755 "${helper}" || true
-    fi
-done
 # 4. Install Kernel Modules
 if [ -d "${MODULES_DIR}" ]; then
     echo "[*] Installing kernel modules..."
@@ -291,19 +283,83 @@ if [ -d "${ROOT_DIR}/debs" ]; then
     if compgen -G "${ROOT_DIR}/debs/*.deb" > /dev/null; then
         mkdir -p "${ROOTFS_MNT}/tmp/debs"
         cp "${ROOT_DIR}/debs"/*.deb "${ROOTFS_MNT}/tmp/debs/"
-        chroot "${ROOTFS_MNT}" bash -c 'dpkg -i /tmp/debs/*.deb || apt-get -f install -y' 2>/dev/null || true
+        if ! chroot "${ROOTFS_MNT}" bash -c '
+set -e
+
+# Install non-Mali local packages first.
+non_mali_debs="$(find /tmp/debs -maxdepth 1 -type f -name "*.deb" ! -name "libmali*.deb" -print)"
+if [ -n "${non_mali_debs}" ]; then
+    dpkg -i ${non_mali_debs} || apt-get -f install -y
+fi
+
+# Select Mali package priority for current known-good Plasma X11 colors path:
+# g13 x11-gbm -> generic x11-gbm -> x11-wayland-gbm -> wayland-gbm -> any.
+selected_mali_deb=""
+for candidate in \
+    /tmp/debs/libmali*-g13p0*x11-gbm*.deb \
+    /tmp/debs/libmali*-x11-gbm*.deb \
+    /tmp/debs/libmali*-x11-wayland-gbm*.deb \
+    /tmp/debs/libmali*-wayland-gbm*.deb \
+    /tmp/debs/libmali*.deb; do
+    [ -e "${candidate}" ] || continue
+    selected_mali_deb="${candidate}"
+    break
+done
+
+if [ -n "${selected_mali_deb}" ]; then
+    selected_mali_pkg="$(dpkg-deb -f "${selected_mali_deb}" Package)"
+
+    # Ensure only the selected libmali family remains installed.
+    existing_mali_pkgs="$(dpkg -l | awk '"'"'/^ii/ && $2 ~ /^libmali-/ {print $2}'"'"')"
+    if [ -n "${existing_mali_pkgs}" ]; then
+        apt-get purge -y ${existing_mali_pkgs}
+        apt-get -f install -y
+    fi
+
+    dpkg -i "${selected_mali_deb}" || apt-get -f install -y
+    if ! dpkg -s "${selected_mali_pkg}" 2>/dev/null | grep -q "^Status: install ok installed$"; then
+        echo "[-] Error: failed to install expected Mali package: ${selected_mali_pkg}"
+        dpkg -l | awk '"'"'/^ii/ && $2 ~ /^libmali-/ {print $2, $3}'"'"' || true
+        exit 1
+    fi
+fi
+        '; then
+            echo "[-] Error: failed to install local GPU/MPP packages in chroot."
+            rm -rf "${ROOTFS_MNT}/tmp/debs"
+            exit 1
+        fi
         rm -rf "${ROOTFS_MNT}/tmp/debs"
     else
         echo "[!] Warning: No .deb files found in ${ROOT_DIR}/debs"
     fi
 fi
 
-# 5b. Prefer Mali EGL/GBM from the installed libmali package over Mesa shims.
-if compgen -G "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/mali/libmali*.so" > /dev/null; then
-    echo "[*] Removing conflicting Mesa EGL/GBM files..."
-    rm -f "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/libEGL_mesa.so.0"*
-    rm -f "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/libgbm.so.1"*
-    rm -f "${ROOTFS_MNT}/usr/share/glvnd/egl_vendor.d/50_mesa.json"
+# 5b. Keep Mesa GBM fallback, and make Mali GBM path use Debian libgbm.
+# Some Mali blobs ship an old libgbm missing gbm_bo_create_with_modifiers2,
+# which causes KWin/Plasma startup failures.
+if compgen -G "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/mali/libmali*.so" > /dev/null || \
+   [ -e "${ROOTFS_MNT}/lib/aarch64-linux-gnu/libmali.so.1" ] || \
+   [ -e "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/libmali.so.1" ] || \
+   [ -e "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/mali/libgbm.so.1" ]; then
+    echo "[*] Preserving Mesa EGL fallback and fixing Mali libgbm path..."
+
+    # Force the Mali libgbm path to resolve to Debian's libgbm implementation.
+    if [ -e "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/libgbm.so.1" ]; then
+        mali_gbm_backup="${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/mali/.libgbm.so.1.rkbak"
+        if [ -e "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/mali/libgbm.so.1" ] && \
+           [ ! -e "${mali_gbm_backup}" ]; then
+            cp -a "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/mali/libgbm.so.1" \
+                  "${mali_gbm_backup}"
+        fi
+        # Drop legacy backup names that match lib*.so*; ldconfig can relink
+        # libgbm.so.1 back to them and undo the intended Debian libgbm pin.
+        rm -f "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/mali/libgbm.so.1.rkbak"
+        ln -sfn /usr/lib/aarch64-linux-gnu/libgbm.so.1 \
+                "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/mali/libgbm.so.1"
+        ln -sfn libgbm.so.1 \
+                "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/mali/libgbm.so"
+    fi
+
     chroot "${ROOTFS_MNT}" ldconfig
 else
     echo "[!] Warning: Mali userspace package not detected; skipping Mesa cleanup."
@@ -419,8 +475,27 @@ Section "InputClass"
     MatchProduct "gsl3673"
     MatchIsTouchscreen "on"
     Driver "libinput"
+    # Keep touch aligned with default X11 landscape-right panel orientation.
+    Option "CalibrationMatrix" "0 1 0 -1 0 1 0 0 1"
 EndSection
 XORG_TS
+
+cat > "${ROOTFS_MNT}/etc/X11/xorg.conf.d/30-panel-landscape.conf" << 'XORG_LANDSCAPE'
+Section "Monitor"
+    Identifier "DSI-1"
+    Option "Rotate" "right"
+EndSection
+
+Section "Monitor"
+    Identifier "eDP-1"
+    Option "Rotate" "right"
+EndSection
+
+Section "Monitor"
+    Identifier "LVDS-1"
+    Option "Rotate" "right"
+EndSection
+XORG_LANDSCAPE
 
 cat > "${ROOTFS_MNT}/etc/X11/xorg.conf.d/20-modesetting-rockchip.conf" << 'XORG_GPU'
 Section "Device"
@@ -429,8 +504,8 @@ Section "Device"
     # glamor is enabled for 2D acceleration.
     # NOTE: xrandr --rotate crashes the X server with the Mali BSP blob because
     # glamor's shadow-framebuffer rotation path is incompatible with this driver.
-    # Screen rotation on X11 is intentionally disabled in the tray app; use the
-    # sway (Wayland) session for smooth, crash-free rotation instead.
+    # Screen rotation on X11 is intentionally disabled in the tray app; use a
+    # Wayland session for smooth, crash-free rotation instead.
     Option "AccelMethod" "glamor"
     Option "DRI" "3"
 EndSection
@@ -739,331 +814,161 @@ cat > "${ROOTFS_MNT}/etc/fstab" << 'FSTAB'
 PARTUUID=c0ffee11-2233-4455-6677-8899aabbccdd  /  ext4  defaults,noatime  0  1
 FSTAB
 
-# 9. Autologin LightDM and disable XFCE auto-suspend
-echo "[*] Configuring LightDM autologin..."
-LIGHTDM_CONF="${ROOTFS_MNT}/etc/lightdm/lightdm.conf"
-mkdir -p "${ROOTFS_MNT}/etc/lightdm"
-# Write a complete, authoritative lightdm.conf so there is no ambiguity.
-# - autologin starts Sway (Wayland) by default.
-# - sessions-directory includes both xsessions (X11) and wayland-sessions.
-cat > "${LIGHTDM_CONF}" << 'LIGHTDM_EOF'
-[LightDM]
-sessions-directory=/usr/share/lightdm/sessions:/usr/share/xsessions:/usr/share/wayland-sessions
+# 9. Configure SDDM autologin for Plasma
+echo "[*] Configuring SDDM autologin..."
+mkdir -p "${ROOTFS_MNT}/etc/sddm.conf.d"
+rm -rf "${ROOTFS_MNT}/etc/lightdm"
 
-[Seat:*]
-autologin-user=chaos
-autologin-user-timeout=0
-autologin-session=sway
-LIGHTDM_EOF
+# Drop stale per-user overrides from previous experiments that can force a
+# mismatched session backend and cause black-screen/login-loop behavior.
+rm -f "${ROOTFS_MNT}/home/chaos/.config/environment.d/90-plasma-x11.conf" \
+      "${ROOTFS_MNT}/home/chaos/.config/environment.d/91-plasma-shell.conf" \
+      "${ROOTFS_MNT}/home/chaos/.config/plasma-org.kde.plasma.phoneshell-appletsrc" \
+      "${ROOTFS_MNT}/home/chaos/.config/plasma-org.kde.plasma.desktop-appletsrc" \
+      "${ROOTFS_MNT}/home/chaos/.config/plasmashellrc"
 
-echo "[*] Disabling xfce4-power-manager auto-suspend..."
-# Power manager config
-mkdir -p "${ROOTFS_MNT}/home/chaos/.config/xfce4/xfconf/xfce-perchannel-xml"
-cat > "${ROOTFS_MNT}/home/chaos/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-power-manager.xml" << 'XFCEPM'
-<?xml version="1.0" encoding="UTF-8"?>
-<channel name="xfce4-power-manager" version="1.0">
-  <property name="xfce4-power-manager" type="empty">
-    <property name="dpms-enabled" type="bool" value="false"/>
-    <property name="blank-on-ac" type="int" value="0"/>
-    <property name="blank-on-battery" type="int" value="0"/>
-    <property name="dpms-on-ac-sleep" type="uint" value="0"/>
-    <property name="dpms-on-ac-off" type="uint" value="0"/>
-    <property name="dpms-on-battery-sleep" type="uint" value="0"/>
-    <property name="dpms-on-battery-off" type="uint" value="0"/>
-    <property name="inactivity-on-ac" type="uint" value="0"/>
-    <property name="inactivity-on-battery" type="uint" value="0"/>
-    <property name="lid-action-on-ac" type="uint" value="0"/>
-    <property name="lid-action-on-battery" type="uint" value="0"/>
-    <property name="sleep-button-action" type="uint" value="0"/>
-    <property name="power-button-action" type="uint" value="0"/>
-    <property name="critical-power-action" type="uint" value="0"/>
-  </property>
-</channel>
-XFCEPM
-chroot "${ROOTFS_MNT}" chown -R chaos:chaos /home/chaos/.config
-
-# Disable XFWM compositor by default on this low-power tablet; helps browser fps.
-cat > "${ROOTFS_MNT}/home/chaos/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml" << 'XFWM4CFG'
-<?xml version="1.0" encoding="UTF-8"?>
-<channel name="xfwm4" version="1.0">
-  <property name="general" type="empty">
-    <property name="use_compositing" type="bool" value="false"/>
-  </property>
-</channel>
-XFWM4CFG
-chroot "${ROOTFS_MNT}" chown chaos:chaos /home/chaos/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml || true
-
-# Setup Xfce power manager autostart
-mkdir -p "${ROOTFS_MNT}/etc/xdg/autostart"
-cat > "${ROOTFS_MNT}/etc/xdg/autostart/xfce4-power-manager.desktop" << 'PMDESKTOP'
-[Desktop Entry]
-Type=Application
-Name=Xfce Power Manager
-Exec=xfce4-power-manager
-OnlyShowIn=XFCE;
-X-XFCE-Autostart-Override=true
-PMDESKTOP
-
-# Keep panel startup deterministic. If a broken saved XFCE session omits the
-# panel, this helper brings it back automatically.
-mkdir -p "${ROOTFS_MNT}/usr/local/bin"
-cat > "${ROOTFS_MNT}/usr/local/bin/rk-xfce4-panel-start.sh" << 'RK_PANEL_START'
-#!/bin/sh
-set -eu
-
-PATH=/usr/bin:/bin
-
-if pgrep -x xfce4-panel >/dev/null 2>&1; then
-    exit 0
-fi
-
-for _ in $(seq 1 25); do
-    dbus-send --session --dest=org.freedesktop.DBus --type=method_call \
-      /org/freedesktop/DBus org.freedesktop.DBus.ListNames >/dev/null 2>&1 && break
-    sleep 1
-done
-
-exec xfce4-panel
-RK_PANEL_START
-chmod +x "${ROOTFS_MNT}/usr/local/bin/rk-xfce4-panel-start.sh"
-
-cat > "${ROOTFS_MNT}/etc/xdg/autostart/rk-xfce4-panel.desktop" << 'RK_PANEL_DESKTOP'
-[Desktop Entry]
-Type=Application
-Name=RK XFCE Panel Start
-Exec=/usr/local/bin/rk-xfce4-panel-start.sh
-OnlyShowIn=XFCE;
-X-GNOME-Autostart-enabled=true
-NoDisplay=true
-RK_PANEL_DESKTOP
-
-# Avoid persisting a "panel-less" saved session across reboots.
-mkdir -p "${ROOTFS_MNT}/home/chaos/.config/xfce4/xfconf/xfce-perchannel-xml"
-cat > "${ROOTFS_MNT}/home/chaos/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-session.xml" << 'XFCESESSION'
-<?xml version="1.0" encoding="UTF-8"?>
-<channel name="xfce4-session" version="1.0">
-  <property name="general" type="empty">
-    <property name="SaveOnExit" type="bool" value="false"/>
-  </property>
-</channel>
-XFCESESSION
-chroot "${ROOTFS_MNT}" chown chaos:chaos /home/chaos/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-session.xml || true
-
-# GTK/icon theme — Adwaita-dark GTK theme + Adwaita icon theme.
-# Both ship in Debian Bookworm (gnome-themes-extra-data / adwaita-icon-theme).
-# Adwaita v43 has clean SVG tray icons: battery levels, wifi bars, bluetooth,
-# volume, brightness — all consistent and sharp.
-mkdir -p "${ROOTFS_MNT}/home/chaos/.config/xfce4/xfconf/xfce-perchannel-xml"
-cat > "${ROOTFS_MNT}/home/chaos/.config/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml" << 'XSETTINGS_XML'
-<?xml version="1.0" encoding="UTF-8"?>
-<channel name="xsettings" version="1.0">
-  <property name="Net" type="empty">
-    <property name="ThemeName"     type="string" value="Adwaita-dark"/>
-    <property name="IconThemeName" type="string" value="Adwaita"/>
-  </property>
-  <property name="Gtk" type="empty">
-    <property name="CursorThemeName" type="string" value="Adwaita"/>
-    <property name="CursorThemeSize" type="int"    value="24"/>
-    <property name="FontName"        type="string" value="Sans 11"/>
-    <property name="MonospaceFontName" type="string" value="Monospace 11"/>
-  </property>
-</channel>
-XSETTINGS_XML
-chroot "${ROOTFS_MNT}" chown chaos:chaos \
-    /home/chaos/.config/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml || true
-
-# Default XFCE wallpaper.
-cat > "${ROOTFS_MNT}/home/chaos/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml" << 'XFCE4_DESKTOP_XML'
-<?xml version="1.0" encoding="UTF-8"?>
-<channel name="xfce4-desktop" version="1.0">
-  <property name="backdrop" type="empty">
-    <property name="single-workspace-mode" type="bool" value="true"/>
-    <property name="single-workspace-number" type="int" value="0"/>
-    <property name="screen0" type="empty">
-      <property name="monitor0" type="empty">
-        <property name="workspace0" type="empty">
-          <property name="last-image" type="string" value="/usr/share/backgrounds/rkdebian/splash.png"/>
-          <property name="image-style" type="int" value="5"/>
-        </property>
-      </property>
-      <property name="monitorDSI-1" type="empty">
-        <property name="workspace0" type="empty">
-          <property name="last-image" type="string" value="/usr/share/backgrounds/rkdebian/splash.png"/>
-          <property name="image-style" type="int" value="5"/>
-        </property>
-      </property>
-    </property>
-  </property>
-</channel>
-XFCE4_DESKTOP_XML
-chroot "${ROOTFS_MNT}" chown chaos:chaos \
-    /home/chaos/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml || true
-
-# GTK3 settings file as fallback for apps that bypass xsettings.
-mkdir -p "${ROOTFS_MNT}/home/chaos/.config/gtk-3.0"
-cat > "${ROOTFS_MNT}/home/chaos/.config/gtk-3.0/settings.ini" << 'GTK3CFG'
-[Settings]
-gtk-theme-name=Adwaita-dark
-gtk-icon-theme-name=Adwaita
-gtk-cursor-theme-name=Adwaita
-gtk-cursor-theme-size=24
-gtk-font-name=Sans 11
-gtk-application-prefer-dark-theme=1
-GTK3CFG
-chroot "${ROOTFS_MNT}" chown -R chaos:chaos /home/chaos/.config/gtk-3.0 || true
-
-# Ensure Wi-Fi/Bluetooth tray applets are launched in XFCE even if package
-# autostart files are missing in this rootfs variant.
-if [ ! -f "${ROOTFS_MNT}/etc/xdg/autostart/nm-applet.desktop" ]; then
-cat > "${ROOTFS_MNT}/etc/xdg/autostart/nm-applet.desktop" << 'NMAP'
-[Desktop Entry]
-Type=Application
-Name=Network Manager Applet
-Exec=nm-applet
-OnlyShowIn=XFCE;
-X-GNOME-Autostart-enabled=true
-NMAP
-fi
-
-if [ ! -f "${ROOTFS_MNT}/etc/xdg/autostart/blueman.desktop" ] && \
-   [ ! -f "${ROOTFS_MNT}/etc/xdg/autostart/blueman-applet.desktop" ]; then
-cat > "${ROOTFS_MNT}/etc/xdg/autostart/blueman-applet.desktop" << 'BLUEMAN'
-[Desktop Entry]
-Type=Application
-Name=Blueman Applet
-Exec=blueman-applet
-OnlyShowIn=XFCE;
-X-GNOME-Autostart-enabled=true
-BLUEMAN
-fi
-
-# Add an explicit XFCE autostart entry for blueman so login behavior stays
-# deterministic across desktop-package variants.
-mkdir -p "${ROOTFS_MNT}/usr/local/bin"
-cat > "${ROOTFS_MNT}/usr/local/bin/rk-blueman-applet-start.sh" << 'RK_BLUEMAN_START'
-#!/bin/sh
-set -eu
-
-PATH=/usr/bin:/bin
-
-# Wait for session DBus/panel startup to avoid autostart races.
-for _ in $(seq 1 20); do
-    dbus-send --session --dest=org.freedesktop.DBus --type=method_call \
-      /org/freedesktop/DBus org.freedesktop.DBus.ListNames >/dev/null 2>&1 && break
-    sleep 1
-done
-
-panel_has_tray() {
-    xfconf-query -c xfce4-panel -lv 2>/dev/null | awk '
-    $1 ~ /^\/plugins\/plugin-[0-9]+$/ && ($2 == "systray" || $2 == "statusnotifier" || $2 == "indicator") { found=1 }
-    END { exit(found ? 0 : 1) }'
-}
-
-ensure_panel() {
-    if ! pgrep -x xfce4-panel >/dev/null 2>&1; then
-        xfce4-panel >/dev/null 2>&1 &
-        sleep 2
-    fi
-}
-
-repair_panel_if_needed() {
-    if ! command -v xfconf-query >/dev/null 2>&1; then
-        return 0
-    fi
-    if panel_has_tray; then
-        return 0
-    fi
-    # Reset panel config if tray plugins are missing; this restores defaults.
-    pkill -x xfce4-panel >/dev/null 2>&1 || true
-    rm -f "${HOME}/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml"
-    rm -rf "${HOME}/.config/xfce4/panel"
-    xfce4-panel >/dev/null 2>&1 &
-    sleep 3
-}
-
-wait_for_system_bluez() {
-    for _ in $(seq 1 30); do
-        if dbus-send --system --dest=org.freedesktop.DBus --type=method_call \
-          /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner string:org.bluez \
-          2>/dev/null | grep -q "boolean true"; then
-            return 0
+# Prefer Plasma X11 by default.
+PLASMA_SESSION="plasma.desktop"
+PLASMA_DISPLAY_SERVER="x11"
+if [ ! -f "${ROOTFS_MNT}/usr/share/xsessions/${PLASMA_SESSION}" ]; then
+    echo "[!] Warning: ${PLASMA_SESSION} missing in /usr/share/xsessions; scanning fallback sessions."
+    PLASMA_SESSION=""
+    for candidate in plasma.desktop plasma-mobile.desktop plasmawayland.desktop; do
+        if [ -f "${ROOTFS_MNT}/usr/share/xsessions/${candidate}" ] || \
+           [ -f "${ROOTFS_MNT}/usr/share/wayland-sessions/${candidate}" ]; then
+            PLASMA_SESSION="${candidate}"
+            break
         fi
-        sleep 1
     done
-    return 1
-}
-
-controller_ready() {
-    bluetoothctl list 2>/dev/null | grep -q '^Controller '
-}
-
-prepare_bluetooth() {
-    if command -v rfkill >/dev/null 2>&1; then
-        rfkill unblock all >/dev/null 2>&1 || true
+    if [ -z "${PLASMA_SESSION}" ]; then
+        PLASMA_SESSION="plasma.desktop"
+        echo "[!] Warning: no Plasma session desktop file detected; defaulting to ${PLASMA_SESSION}."
     fi
-    if command -v bluetoothctl >/dev/null 2>&1; then
-        wait_for_system_bluez || true
-        for _ in $(seq 1 15); do
-            controller_ready && break
-            sleep 1
-        done
-        printf 'power on\nquit\n' | bluetoothctl >/dev/null 2>&1 || true
+    if [ ! -f "${ROOTFS_MNT}/usr/share/xsessions/${PLASMA_SESSION}" ]; then
+        PLASMA_DISPLAY_SERVER="wayland"
+        echo "[!] Warning: ${PLASMA_SESSION} is not an X11 session; using DisplayServer=${PLASMA_DISPLAY_SERVER}."
     fi
-}
+fi
 
-ensure_panel
-repair_panel_if_needed
-prepare_bluetooth
+cat > "${ROOTFS_MNT}/etc/sddm.conf.d/10-rk-autologin.conf" << SDDM_AUTLOGIN
+[Autologin]
+User=chaos
+Session=${PLASMA_SESSION}
+Relogin=false
 
-# Kill duplicates from package autostart entries, then keep retrying in case
-# the applet exits before the controller is ready.
-pkill -x blueman-applet >/dev/null 2>&1 || true
-sleep 1
-while :; do
-    if blueman-applet >/dev/null 2>&1; then
-        :
-    fi
-    sleep 3
-    prepare_bluetooth
-done
-RK_BLUEMAN_START
-chmod +x "${ROOTFS_MNT}/usr/local/bin/rk-blueman-applet-start.sh"
+[General]
+DisplayServer=${PLASMA_DISPLAY_SERVER}
+SDDM_AUTLOGIN
 
-cat > "${ROOTFS_MNT}/etc/xdg/autostart/rk-blueman-applet.desktop" << 'RK_BLUEMAN'
+# Stale user-unit symlinks from old sway-focused rootfs trees can trigger
+# waybar restart loops in Plasma sessions (and tank UI responsiveness).
+rm -f "${ROOTFS_MNT}/etc/systemd/user/graphical-session.target.wants/waybar.service"
+
+# Configure an on-screen keyboard at the greeter for touch-only login.
+cat > "${ROOTFS_MNT}/etc/sddm.conf.d/20-rk-virtual-keyboard.conf" << 'SDDM_VK'
+[General]
+InputMethod=qtvirtualkeyboard
+GreeterEnvironment=QT_IM_MODULE=qtvirtualkeyboard
+SDDM_VK
+
+# Auto-show Maliit keyboard in Plasma sessions (Qt + GTK apps).
+mkdir -p "${ROOTFS_MNT}/home/chaos/.config/plasma-workspace/env"
+cat > "${ROOTFS_MNT}/home/chaos/.config/plasma-workspace/env/90-inputmethod.sh" << 'IM_ENV'
+#!/bin/sh
+export GTK_IM_MODULE=Maliit
+export QT_IM_MODULE=MaliitPhablet
+export XMODIFIERS=@im=none
+IM_ENV
+chmod +x "${ROOTFS_MNT}/home/chaos/.config/plasma-workspace/env/90-inputmethod.sh"
+chroot "${ROOTFS_MNT}" chown chaos:chaos /home/chaos/.config/plasma-workspace/env/90-inputmethod.sh || true
+
+mkdir -p "${ROOTFS_MNT}/home/chaos/.config/autostart"
+cat > "${ROOTFS_MNT}/home/chaos/.config/autostart/maliit-server.desktop" << 'MALIIT_AUTOSTART'
 [Desktop Entry]
 Type=Application
-Name=RK Blueman Applet
-Exec=/usr/local/bin/rk-blueman-applet-start.sh
-OnlyShowIn=XFCE;
+Name=Maliit Server
+Comment=On-screen keyboard input method service
+Exec=/usr/bin/maliit-server
+OnlyShowIn=KDE;
 X-GNOME-Autostart-enabled=true
 NoDisplay=true
-RK_BLUEMAN
+MALIIT_AUTOSTART
+chroot "${ROOTFS_MNT}" chown chaos:chaos /home/chaos/.config/autostart/maliit-server.desktop || true
 
+# Prevent duplicate/competing keyboards when reusing an old rootfs tree.
+cat > "${ROOTFS_MNT}/home/chaos/.config/autostart/onboard.desktop" << 'ONBOARD_HIDE'
+[Desktop Entry]
+Hidden=true
+ONBOARD_HIDE
+cat > "${ROOTFS_MNT}/home/chaos/.config/autostart/maliit-keyboard.desktop" << 'MALIIT_KEYBOARD_HIDE'
+[Desktop Entry]
+Hidden=true
+MALIIT_KEYBOARD_HIDE
+chroot "${ROOTFS_MNT}" chown chaos:chaos /home/chaos/.config/autostart/onboard.desktop \
+    /home/chaos/.config/autostart/maliit-keyboard.desktop || true
+
+# Trim background autostarts that are unnecessary in the Plasma tablet image.
+# These either belong to other desktops (XFCE/GNOME) or are optional daemons
+# that cost responsiveness on software-rendered Plasma X11.
+PLASMA_DISABLE_AUTOSTARTS="
+ayatana-indicator-application.desktop
+blueman.desktop
+geoclue-demo-agent.desktop
+kup-daemon.desktop
+light-locker.desktop
+org.gnome.Software.desktop
+print-applet.desktop
+rk-xfce4-panel.desktop
+xfce4-notifyd.desktop
+xfce4-power-manager.desktop
+xfsettingsd.desktop
+"
+
+for desktop in ${PLASMA_DISABLE_AUTOSTARTS}; do
+cat > "${ROOTFS_MNT}/home/chaos/.config/autostart/${desktop}" << 'AUTOSTART_HIDE'
+[Desktop Entry]
+Hidden=true
+AUTOSTART_HIDE
+chroot "${ROOTFS_MNT}" chown chaos:chaos "/home/chaos/.config/autostart/${desktop}" || true
+done
+
+# Keep a fallback polkit agent autostart for Plasma sessions.
+mkdir -p "${ROOTFS_MNT}/etc/xdg/autostart"
 if [ ! -f "${ROOTFS_MNT}/etc/xdg/autostart/polkit-gnome-authentication-agent-1.desktop" ]; then
 cat > "${ROOTFS_MNT}/etc/xdg/autostart/polkit-gnome-authentication-agent-1.desktop" << 'POLKIT'
 [Desktop Entry]
 Type=Application
 Name=PolicyKit Authentication Agent
 Exec=/usr/lib/policykit-1-gnome/polkit-gnome-authentication-agent-1
-OnlyShowIn=XFCE;
+OnlyShowIn=KDE;
 X-GNOME-Autostart-enabled=true
 POLKIT
 fi
 
-# Add a desktop shortcut for the on-screen keyboard.
+# Optional launcher shortcut for maliit keyboard.
 mkdir -p "${ROOTFS_MNT}/home/chaos/Desktop"
-cat > "${ROOTFS_MNT}/home/chaos/Desktop/on-screen-keyboard.desktop" << 'ONBOARD'
+cat > "${ROOTFS_MNT}/home/chaos/Desktop/on-screen-keyboard.desktop" << 'MALIIT'
 [Desktop Entry]
 Type=Application
 Name=On-Screen Keyboard
 Comment=Launch on-screen keyboard
-Exec=onboard
-Icon=onboard
+Exec=maliit-keyboard
+Icon=input-keyboard
 Terminal=false
 Categories=Utility;
-ONBOARD
+MALIIT
 chmod +x "${ROOTFS_MNT}/home/chaos/Desktop/on-screen-keyboard.desktop"
 chroot "${ROOTFS_MNT}" chown chaos:chaos /home/chaos/Desktop/on-screen-keyboard.desktop || true
+
+# Ensure user-level Plasma config/cache dirs are writable by the session user.
+# Some build-time mkdir operations run as root and can otherwise leave these
+# directories owned by root, which breaks Plasma startup.
+mkdir -p "${ROOTFS_MNT}/home/chaos/.local" "${ROOTFS_MNT}/home/chaos/.cache"
+chroot "${ROOTFS_MNT}" chown -R chaos:chaos \
+    /home/chaos/.config \
+    /home/chaos/.local \
+    /home/chaos/.cache \
+    /home/chaos/Desktop || true
 
 # Power key: short press = suspend, long press = poweroff
 mkdir -p "${ROOTFS_MNT}/etc/systemd/logind.conf.d"
@@ -1078,8 +983,7 @@ mkdir -p "${ROOTFS_MNT}/etc/polkit-1/rules.d"
 cat > "${ROOTFS_MNT}/etc/polkit-1/rules.d/49-backlight.rules" << 'BACKLIGHT_POLKIT'
 polkit.addRule(function(action, subject) {
     var backlightAction =
-        action.id == "org.freedesktop.login1.set-backlight" ||
-        action.id == "org.xfce.power.backlight-helper";
+        action.id == "org.freedesktop.login1.set-backlight";
 
     if (!backlightAction) {
         return;
@@ -1249,7 +1153,7 @@ cat > "${ROOTFS_MNT}/usr/local/bin/rk-screen-rotate.py" << 'RK_SCREEN_ROTATE'
 #!/usr/bin/env python3
 """System-tray applet for screen rotation on RK3562 tablet.
 
-Works in both X11 (XFCE) and Wayland (sway/wlroots) sessions.
+Works in X11 and in Wayland sessions that provide swaymsg-compatible output IPC.
 
 Under X11:  uses xrandr for display rotation and xinput for touch mapping.
 Under Wayland: uses swaymsg output transforms, maps the touchscreen to the
@@ -1590,7 +1494,7 @@ class RotateTray:
 
         if not IS_WAYLAND:
             note = Gtk.MenuItem(
-                label="⚠ Rotation only works in sway (Wayland)"
+                label="⚠ Rotation requires swaymsg-compatible Wayland"
             )
             note.set_sensitive(False)
             menu.append(note)
@@ -1683,949 +1587,7 @@ if __name__ == "__main__":
 RK_SCREEN_ROTATE
 chmod +x "${ROOTFS_MNT}/usr/local/bin/rk-screen-rotate.py"
 
-# Autostart the tray applet inside the XFCE session.
-mkdir -p "${ROOTFS_MNT}/etc/xdg/autostart"
-cat > "${ROOTFS_MNT}/etc/xdg/autostart/rk-screen-rotate.desktop" << 'RK_ROTATE_DESKTOP'
-[Desktop Entry]
-Type=Application
-Name=Screen Rotation
-Comment=Tray applet for screen rotation control
-Exec=/usr/local/bin/rk-screen-rotate.py
-Icon=video-display
-X-GNOME-Autostart-enabled=true
-OnlyShowIn=XFCE;
-RK_ROTATE_DESKTOP
-
-# ── Wayland / sway alternate session ─────────────────────────────────────────
-# Everything below is isolated to the sway session.  The XFCE/X11 session is
-# completely unaffected: LightDM autologins to xfce by default; sway config
-# lives in its own directory; all autostart entries use OnlyShowIn=sway.
-# sway is in Debian Bookworm (v1.7.2) — no external repos needed.
-echo "[*] Installing sway Wayland session..."
-
-# Session wrapper — sets env vars sway needs on a BSP Rockchip kernel.
-mkdir -p "${ROOTFS_MNT}/usr/local/bin"
-cat > "${ROOTFS_MNT}/usr/local/bin/rk-sway-session.sh" << 'RK_SWAY_SESSION'
-#!/bin/sh
-# No hardware cursor plane on RK3562 Esmart-only VOP2
-export WLR_NO_HARDWARE_CURSORS=1
-# Use DRM/KMS backend (explicit, in case DISPLAY is set from su/ssh)
-export WLR_BACKENDS=drm,libinput
-# Force libseat to use logind for device access (input group not required)
-export LIBSEAT_BACKEND=logind
-export XDG_SESSION_TYPE=wayland
-export XDG_CURRENT_DESKTOP=sway
-export GDK_BACKEND=wayland,x11
-export QT_QPA_PLATFORM="wayland;xcb"
-export SDL_VIDEODRIVER=wayland
-export MOZ_ENABLE_WAYLAND=1
-export MOZ_DISABLE_RDD_SANDBOX=1
-export ELECTRON_OZONE_PLATFORM_HINT=wayland
-export _JAVA_AWT_WM_NONREPARENTING=1
-exec sway
-RK_SWAY_SESSION
-chmod +x "${ROOTFS_MNT}/usr/local/bin/rk-sway-session.sh"
-
-# LightDM Wayland session entry — overrides the one shipped by the sway
-# package so our wrapper script is used (for the env vars above).
-mkdir -p "${ROOTFS_MNT}/usr/share/wayland-sessions"
-cat > "${ROOTFS_MNT}/usr/share/wayland-sessions/sway.desktop" << 'SWAY_SESSION'
-[Desktop Entry]
-Name=sway (Wayland)
-Comment=sway wlroots Wayland compositor
-Exec=/usr/local/bin/rk-sway-session.sh
-Type=Application
-DesktopNames=sway
-SWAY_SESSION
-
-# sway configuration
-mkdir -p "${ROOTFS_MNT}/home/chaos/.config/sway"
-
-# NetworkManager tray applet wrapper — larger GTK scale so the Wi-Fi menu is
-# easier to read/tap on touchscreens.
-cat > "${ROOTFS_MNT}/usr/local/bin/rk-nm-applet-start.sh" << 'RK_NM_APPLET'
-#!/bin/sh
-export GDK_SCALE=3
-export GDK_DPI_SCALE=0.90
-exec nm-applet --indicator
-RK_NM_APPLET
-chmod +x "${ROOTFS_MNT}/usr/local/bin/rk-nm-applet-start.sh"
-
-cat > "${ROOTFS_MNT}/home/chaos/.config/sway/config" << 'SWAY_CFG'
-### Variables
-set $mod Mod4
-set $term foot
-set $menu /usr/local/bin/rk-launcher.sh
-set $kbd  /usr/local/bin/rk-keyboard-toggle.sh
-set $wall /usr/local/bin/rk-wallpaper-picker.py
-
-### Keep Xwayland enabled as compatibility fallback for X11/Electron apps.
-xwayland enable
-
-### Output — 800×1280 portrait panel; default landscape = 90° CW
-# rk-screen-rotate.py will update this at runtime; setting it here avoids
-# the portrait flash while the tray applet starts.
-output DSI-1 transform 90
-output * bg #1a1b26 solid_color
-
-### Input
-input type:touch {
-    tap enabled
-    natural_scroll disabled
-    map_to_output DSI-1
-}
-
-### Font and borders
-font pango:DejaVu Sans 13
-default_border pixel 2
-default_floating_border pixel 2
-smart_borders on
-gaps inner 6
-gaps outer 0
-
-### Focus highlight colors (Tokyo Night palette)
-client.focused          #7aa2f7 #24283b #c0caf5 #7aa2f7 #7aa2f7
-client.unfocused        #292e42 #1a1b26 #545c7e #292e42 #292e42
-client.focused_inactive #292e42 #1a1b26 #c0caf5 #292e42 #292e42
-client.urgent           #f7768e #1a1b26 #f7768e #f7768e #f7768e
-
-### Default layout: tabbed — apps fill the screen, switch via tab bar at top
-workspace_layout tabbed
-
-### Window rules — dialogs float centered, most apps tile
-for_window [window_role="dialog"]           floating enable, border pixel 2, move position center
-for_window [window_role="pop-up"]           floating enable, border pixel 2, move position center
-for_window [app_id="pavucontrol"]           floating enable, resize set 640 420, move position center
-for_window [app_id="nm-connection-editor"]  floating enable, resize set 640 520, move position center
-for_window [app_id=".*[Ss]ettings.*"]       floating enable, move position center
-for_window [title=".*[Pp]references.*"]     floating enable, move position center
-
-### Key bindings
-bindsym $mod+Return exec $term
-bindsym $mod+d      exec $menu
-bindsym $mod+k      exec $kbd
-bindsym $mod+w      exec $wall
-bindsym $mod+q      kill
-bindsym $mod+f      fullscreen toggle
-bindsym $mod+Tab    focus next sibling
-bindsym $mod+Shift+Tab focus prev sibling
-bindsym $mod+Shift+e exec swaymsg exit
-bindsym XF86PowerOff exec /usr/local/bin/rk-power-menu.sh
-
-### Panel
-bar {
-    swaybar_command waybar
-}
-
-### Autostart
-exec /usr/local/bin/rk-screen-rotate.py
-exec /usr/local/bin/rk-nm-applet-start.sh
-exec blueman-applet
-exec /usr/local/bin/rk-appearance-apply.sh
-exec mako
-# squeekboard: auto-shows when a text field gains focus (input-method protocol).
-# No-op if not installed.
-exec sh -c 'command -v squeekboard >/dev/null 2>&1 && exec squeekboard'
-SWAY_CFG
-
-# Touch-friendly power dialog — GTK3, icon buttons, no search bar, no scroll.
-# Replaces the wofi dmenu approach which couldn't reliably hide its search bar.
-cat > "${ROOTFS_MNT}/usr/local/bin/rk-power-dialog.py" << 'RK_POWER_DIALOG'
-#!/usr/bin/env python3
-"""Touch-friendly Wayland power dialog — icon buttons, no search."""
-import gi, subprocess
-gi.require_version('Gtk', '3.0')
-from gi.repository import Gtk, Gdk
-
-CSS = b"""
-window.power-dialog {
-    background-color: #1c1c1e;
-    border-radius: 14px;
-    border: 1px solid #3a3a3c;
-}
-.btn-action {
-    background: rgba(255,255,255,0.07);
-    color: #f2f2f7;
-    border-radius: 10px;
-    border: 1px solid rgba(255,255,255,0.12);
-    padding: 16px 10px;
-    font-size: 13px;
-    min-width: 120px;
-    min-height: 110px;
-}
-.btn-action:hover  { background: rgba(255,255,255,0.15); }
-.btn-action:active { background: rgba(255,255,255,0.25); }
-.btn-cancel {
-    background: rgba(255,59,48,0.15);
-    color: #ff453a;
-    border-radius: 10px;
-    border: 1px solid rgba(255,59,48,0.28);
-    padding: 12px;
-    font-size: 13px;
-}
-.btn-cancel:hover { background: rgba(255,59,48,0.25); }
-.title-label { color: #ebebf5; font-size: 15px; font-weight: bold; }
-"""
-
-ACTIONS = [
-    ("system-shutdown", "Shut Down", ["systemctl", "poweroff"]),
-    ("system-reboot",   "Restart",   ["systemctl", "reboot"]),
-    ("system-log-out",  "Log Out",   ["swaymsg",   "exit"]),
-]
-
-class PowerDialog(Gtk.Window):
-    def __init__(self):
-        super().__init__()
-        self.get_style_context().add_class("power-dialog")
-        self.set_title("Power")
-        self.set_default_size(480, 300)
-        self.set_position(Gtk.WindowPosition.CENTER)
-        self.set_decorated(False)
-        self.set_keep_above(True)
-        self.set_resizable(False)
-        self.set_type_hint(Gdk.WindowTypeHint.DIALOG)
-
-        provider = Gtk.CssProvider()
-        provider.load_from_data(CSS)
-        Gtk.StyleContext.add_provider_for_screen(
-            self.get_screen(), provider,
-            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
-        )
-
-        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
-        outer.set_margin_top(24)
-        outer.set_margin_bottom(20)
-        outer.set_margin_start(20)
-        outer.set_margin_end(20)
-        self.add(outer)
-
-        title = Gtk.Label(label="Power Options")
-        title.get_style_context().add_class("title-label")
-        outer.pack_start(title, False, False, 0)
-
-        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        row.set_homogeneous(True)
-        outer.pack_start(row, True, True, 0)
-
-        for icon_name, label_text, cmd in ACTIONS:
-            btn = Gtk.Button()
-            btn.get_style_context().add_class("btn-action")
-            content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-            content.set_halign(Gtk.Align.CENTER)
-            icon = Gtk.Image.new_from_icon_name(icon_name, Gtk.IconSize.DIALOG)
-            lbl = Gtk.Label(label=label_text)
-            content.pack_start(icon, False, False, 0)
-            content.pack_start(lbl, False, False, 0)
-            btn.add(content)
-            btn.connect("clicked", self.run_cmd, cmd)
-            row.pack_start(btn, True, True, 0)
-
-        cancel = Gtk.Button(label="Cancel")
-        cancel.get_style_context().add_class("btn-cancel")
-        cancel.connect("clicked", lambda *_: Gtk.main_quit())
-        outer.pack_start(cancel, False, False, 0)
-
-        self.connect("delete-event", lambda *_: Gtk.main_quit())
-        self.connect("key-press-event", self.on_key)
-
-    def on_key(self, w, event):
-        if event.keyval == Gdk.KEY_Escape:
-            Gtk.main_quit()
-
-    def run_cmd(self, btn, cmd):
-        subprocess.Popen(cmd)
-        Gtk.main_quit()
-
-win = PowerDialog()
-win.show_all()
-Gtk.main()
-RK_POWER_DIALOG
-chmod +x "${ROOTFS_MNT}/usr/local/bin/rk-power-dialog.py"
-
-# rk-power-menu.sh now just launches the GTK dialog (kills any leftover first).
-cat > "${ROOTFS_MNT}/usr/local/bin/rk-power-menu.sh" << 'RK_POWER_MENU'
-#!/bin/sh
-pkill -f rk-power-dialog.py 2>/dev/null || true
-sleep 0.05
-exec /usr/local/bin/rk-power-dialog.py
-RK_POWER_MENU
-chmod +x "${ROOTFS_MNT}/usr/local/bin/rk-power-menu.sh"
-
-# App launcher toggle — first press opens the app grid, second press closes it.
-# Uses current screen dimensions so it fills correctly in portrait/landscape.
-cat > "${ROOTFS_MNT}/usr/local/bin/rk-launcher.sh" << 'RK_LAUNCHER'
-#!/bin/sh
-if pgrep -x wofi >/dev/null 2>&1; then
-    pkill -x wofi >/dev/null 2>&1 || true
-    exit 0
-fi
-
-find_sway_sock() {
-    uid="$(id -u)"
-    runtime_dir="${XDG_RUNTIME_DIR:-/run/user/${uid}}"
-
-    if [ -n "${SWAYSOCK:-}" ] && [ -S "${SWAYSOCK}" ] && \
-       swaymsg -s "${SWAYSOCK}" -t get_version >/dev/null 2>&1; then
-        echo "${SWAYSOCK}"
-        return 0
-    fi
-
-    for s in "${runtime_dir}"/sway-ipc.*.sock "${runtime_dir}"/sway*.sock; do
-        [ -S "${s}" ] || continue
-        if swaymsg -s "${s}" -t get_version >/dev/null 2>&1; then
-            echo "${s}"
-            return 0
-        fi
-    done
-    return 1
-}
-
-# Read current output dimensions from sway
-SOCK="$(find_sway_sock || true)"
-if [ -n "${SOCK}" ]; then
-    DIMS=$(SWAYSOCK="${SOCK}" swaymsg -t get_outputs 2>/dev/null | \
-      python3 -c "import sys,json; o=json.load(sys.stdin)[0]['rect']; print(o['width'], o['height'])" 2>/dev/null)
-else
-    DIMS=""
-fi
-
-W=$(echo "$DIMS" | cut -d' ' -f1)
-H=$(echo "$DIMS" | cut -d' ' -f2)
-[ -z "$W" ] && W=800
-[ -z "$H" ] && H=1280
-
-H=$((H - 52))  # subtract waybar height
-
-# Portrait → 3 columns, Landscape → 5 columns
-if [ "$W" -lt "$H" ]; then
-    COLS=3
-else
-    COLS=5
-fi
-
-exec wofi --show drun \
-          --width "$W" --height "$H" \
-          --cache-file=/dev/null \
-          --no-actions \
-          --allow-images \
-          --columns "$COLS" \
-          2>/dev/null
-RK_LAUNCHER
-chmod +x "${ROOTFS_MNT}/usr/local/bin/rk-launcher.sh"
-
-# App Store launcher helper (works from waybar and key bindings).
-cat > "${ROOTFS_MNT}/usr/local/bin/rk-app-store.sh" << 'RK_APP_STORE'
-#!/bin/sh
-set -eu
-
-LOG=/tmp/rk-app-store-click.log
-{
-    printf '=== %s ===\n' "$(date -Is)"
-    printf 'argv0=%s uid=%s user=%s\n' "$0" "$(id -u)" "$(id -un)"
-    printf 'env WAYLAND=%s DISPLAY=%s XDG_RUNTIME_DIR=%s DBUS=%s\n' \
-        "${WAYLAND_DISPLAY:-}" "${DISPLAY:-}" "${XDG_RUNTIME_DIR:-}" "${DBUS_SESSION_BUS_ADDRESS:-}"
-} >> "$LOG" 2>/dev/null || true
-
-find_session_pid() {
-    pgrep -u "$(id -u)" -n waybar 2>/dev/null && return 0
-    pgrep -u "$(id -u)" -n sway 2>/dev/null && return 0
-    pgrep -u "$(id -u)" -n xfce4-panel 2>/dev/null && return 0
-    pgrep -u "$(id -u)" -n xfce4-session 2>/dev/null && return 0
-    return 1
-}
-
-load_session_env() {
-    pid="$1"
-    [ -r "/proc/${pid}/environ" ] || return 1
-
-    while IFS= read -r kv; do
-        [ -n "${kv}" ] && export "${kv}"
-    done <<EOF_ENV
-$(tr '\0' '\n' < "/proc/${pid}/environ" | grep -E '^(WAYLAND_DISPLAY|DISPLAY|XDG_RUNTIME_DIR|DBUS_SESSION_BUS_ADDRESS|SWAYSOCK|XDG_SESSION_TYPE|GDK_BACKEND|QT_QPA_PLATFORM)=' || true)
-EOF_ENV
-}
-
-if [ -z "${WAYLAND_DISPLAY:-}" ] && [ -z "${DISPLAY:-}" ]; then
-    if pid=$(find_session_pid); then
-        load_session_env "$pid" || true
-    fi
-fi
-
-if [ -z "${XDG_RUNTIME_DIR:-}" ]; then
-    export XDG_RUNTIME_DIR="/run/user/$(id -u)"
-fi
-if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -S "${XDG_RUNTIME_DIR}/bus" ]; then
-    export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
-fi
-
-if ! command -v flatpak >/dev/null 2>&1 || ! command -v wofi >/dev/null 2>&1; then
-    # Last fallback when picker stack is unavailable.
-    if command -v gnome-software >/dev/null 2>&1; then
-        nohup gnome-software >/tmp/rk-app-store.log 2>&1 &
-        exit 0
-    fi
-    exit 1
-fi
-
-flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo >/dev/null 2>&1 || true
-
-LIST_FILE=/tmp/rk-flathub-apps.tsv
-flatpak remote-ls --app --columns=application,name flathub > "$LIST_FILE"
-
-CHOICE=$(awk -F'\t' 'NF >= 2 { printf "%s\t%s\n", $2, $1 }' "$LIST_FILE" | sort -f | \
-    wofi --dmenu --prompt "Install app (Flathub)" --insensitive --cache-file=/dev/null --width 900 --height 720)
-
-[ -n "${CHOICE:-}" ] || exit 0
-APP_ID=$(printf '%s' "$CHOICE" | awk -F'\t' '{print $2}')
-if [ -z "${APP_ID:-}" ]; then
-    APP_ID="$CHOICE"
-fi
-
-apply_wayland_overrides() {
-    app="$1"
-    # Safe no-op for non-Electron apps; helps Electron Flatpaks on sway.
-    flatpak override --user --env=ELECTRON_OZONE_PLATFORM_HINT=wayland "$app" >/dev/null 2>&1 || true
-}
-
-if flatpak list --app --columns=application | grep -Fxq "$APP_ID"; then
-    apply_wayland_overrides "$APP_ID"
-    nohup flatpak run "$APP_ID" >/tmp/rk-app-store.log 2>&1 &
-    exit 0
-fi
-
-if command -v foot >/dev/null 2>&1; then
-    nohup foot -e sh -lc "flatpak install -y flathub '$APP_ID'; flatpak override --user --env=ELECTRON_OZONE_PLATFORM_HINT=wayland '$APP_ID' >/dev/null 2>&1 || true; echo; echo 'Done. Press Enter to close.'; read _" >/dev/null 2>&1 &
-else
-    nohup sh -lc "flatpak install -y flathub '$APP_ID'; flatpak override --user --env=ELECTRON_OZONE_PLATFORM_HINT=wayland '$APP_ID' >/dev/null 2>&1 || true" >/tmp/rk-app-store.log 2>&1 &
-fi
-
-exit 0
-RK_APP_STORE
-chmod +x "${ROOTFS_MNT}/usr/local/bin/rk-app-store.sh"
-
-# Close action button helper:
-# - If app launcher is open, close launcher.
-# - Otherwise close focused app/window.
-cat > "${ROOTFS_MNT}/usr/local/bin/rk-close-action.sh" << 'RK_CLOSE_ACTION'
-#!/bin/sh
-if pgrep -x wofi >/dev/null 2>&1; then
-    pkill -x wofi >/dev/null 2>&1 || true
-    exit 0
-fi
-
-find_sway_sock() {
-    uid="$(id -u)"
-    runtime_dir="${XDG_RUNTIME_DIR:-/run/user/${uid}}"
-
-    if [ -n "${SWAYSOCK:-}" ] && [ -S "${SWAYSOCK}" ] && \
-       swaymsg -s "${SWAYSOCK}" -t get_version >/dev/null 2>&1; then
-        echo "${SWAYSOCK}"
-        return 0
-    fi
-
-    for s in "${runtime_dir}"/sway-ipc.*.sock "${runtime_dir}"/sway*.sock; do
-        [ -S "${s}" ] || continue
-        if swaymsg -s "${s}" -t get_version >/dev/null 2>&1; then
-            echo "${s}"
-            return 0
-        fi
-    done
-    return 1
-}
-
-SOCK="$(find_sway_sock || true)"
-if [ -n "${SOCK}" ]; then
-    exec swaymsg -s "${SOCK}" kill >/dev/null 2>&1
-fi
-
-# Last-resort attempt (works when SWAYSOCK is valid in environment).
-exec swaymsg kill >/dev/null 2>&1
-RK_CLOSE_ACTION
-chmod +x "${ROOTFS_MNT}/usr/local/bin/rk-close-action.sh"
-
-# wvkbd toggle — shows/hides the on-screen keyboard at the bottom of the screen.
-# wvkbd-mobintl is the standard mobile-international layout binary.
-cat > "${ROOTFS_MNT}/usr/local/bin/rk-keyboard-toggle.sh" << 'RK_KBD_TOGGLE'
-#!/bin/sh
-KBD_BIN=""
-for b in wvkbd-mobintl wvkbd; do
-    command -v "$b" > /dev/null 2>&1 && KBD_BIN="$b" && break
-done
-[ -z "$KBD_BIN" ] && exit 0
-
-if pgrep -x "$KBD_BIN" > /dev/null 2>&1; then
-    pkill -x "$KBD_BIN"
-else
-    exec "$KBD_BIN" --landscape-layers full,special -H 260 -L 300 &
-fi
-RK_KBD_TOGGLE
-chmod +x "${ROOTFS_MNT}/usr/local/bin/rk-keyboard-toggle.sh"
-
-# Panel launcher: prefers waybar, falls back to swaybar (already in sway config)
-cat > "${ROOTFS_MNT}/usr/local/bin/rk-sway-panel.sh" << 'RK_SWAY_PANEL'
-#!/bin/sh
-# Kill any existing panel instances before (re)starting
-pkill -x waybar 2>/dev/null || true
-if command -v waybar >/dev/null 2>&1; then
-    exec waybar
-fi
-# waybar not available — swaybar is handled by the bar{} block in sway config
-RK_SWAY_PANEL
-chmod +x "${ROOTFS_MNT}/usr/local/bin/rk-sway-panel.sh"
-
-# Simple swaybar status script (clock + battery)
-cat > "${ROOTFS_MNT}/usr/local/bin/rk-swaybar-status.sh" << 'RK_SWAY_STATUS'
-#!/bin/sh
-while true; do
-    BAT_CAP=""
-    BAT_FILE="/sys/class/power_supply/rk817-battery/capacity"
-    STATUS_FILE="/sys/class/power_supply/rk817-battery/status"
-    if [ -r "${BAT_FILE}" ]; then
-        CAP=$(cat "${BAT_FILE}")
-        STS=$(cat "${STATUS_FILE}" 2>/dev/null || echo "")
-        case "${STS}" in
-            Charging)    BAT_CAP=" ${CAP}%+" ;;
-            Discharging) BAT_CAP=" ${CAP}%" ;;
-            Full)        BAT_CAP=" Full" ;;
-            *)           BAT_CAP=" ${CAP}%" ;;
-        esac
-    fi
-    echo "$(date +'%a %d %b  %H:%M')${BAT_CAP}"
-    sleep 30
-done
-RK_SWAY_STATUS
-chmod +x "${ROOTFS_MNT}/usr/local/bin/rk-swaybar-status.sh"
-
-# Brightness slider — GTK3 popup invoked by the waybar backlight button.
-cat > "${ROOTFS_MNT}/usr/local/bin/rk-brightness-slider.py" << 'RK_BRIGHTNESS_SLIDER'
-#!/usr/bin/env python3
-import gi
-gi.require_version('Gtk', '3.0')
-from gi.repository import Gtk, Gdk
-import subprocess
-
-def get_brightness_pct():
-    try:
-        cur = int(subprocess.check_output(['brightnessctl', 'get']).strip())
-        mx  = int(subprocess.check_output(['brightnessctl', 'max']).strip())
-        return max(5, int(cur * 100 / mx))
-    except:
-        return 50
-
-def set_brightness(pct):
-    subprocess.Popen(['brightnessctl', 'set', f'{int(pct)}%'],
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-win = Gtk.Window()
-win.set_type_hint(Gdk.WindowTypeHint.POPUP_MENU)
-win.set_decorated(False)
-win.set_default_size(500, 64)
-win.set_resizable(False)
-
-css = b"""
-window { background-color: #1a1b26; border: 2px solid #3b4261; border-radius: 8px; }
-label  { color: #b4f9f8; font-size: 18px; }
-scale trough { background-color: #3b4261; border-radius: 4px; min-height: 8px; }
-scale highlight { background-color: #b4f9f8; border-radius: 4px; }
-scale slider { background-color: #c0caf5; border-radius: 12px; min-width: 24px; min-height: 24px; }
-"""
-provider = Gtk.CssProvider()
-provider.load_from_data(css)
-Gtk.StyleContext.add_provider_for_screen(
-    Gdk.Screen.get_default(), provider,
-    Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
-
-box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-box.set_margin_top(12); box.set_margin_bottom(12)
-box.set_margin_start(16); box.set_margin_end(16)
-
-lbl = Gtk.Label(label="☀")
-box.pack_start(lbl, False, False, 0)
-
-adj = Gtk.Adjustment(value=get_brightness_pct(), lower=5, upper=100,
-                     step_increment=5, page_increment=10)
-scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=adj)
-scale.set_digits(0)
-scale.set_value_pos(Gtk.PositionType.RIGHT)
-scale.set_size_request(380, -1)
-
-def on_value_changed(s):
-    set_brightness(s.get_value())
-
-scale.connect('value-changed', on_value_changed)
-box.pack_start(scale, True, True, 0)
-
-win.add(box)
-win.connect('focus-out-event', lambda w, e: Gtk.main_quit())
-win.connect('destroy', Gtk.main_quit)
-win.show_all()
-Gtk.main()
-RK_BRIGHTNESS_SLIDER
-chmod +x "${ROOTFS_MNT}/usr/local/bin/rk-brightness-slider.py"
-
-# Wallpaper apply helper — reads per-user settings and starts swaybg.
-cat > "${ROOTFS_MNT}/usr/local/bin/rk-appearance-apply.sh" << 'RK_APPEAR_APPLY'
-#!/bin/sh
-set -eu
-
-CFG_FILE="${HOME}/.config/rkdebian/appearance.env"
-MODE="fill"
-WALLPAPER="/usr/share/backgrounds/rkdebian/splash.png"
-FALLBACK_COLOR="#1a1b26"
-
-if [ -f "${CFG_FILE}" ]; then
-    # User-owned config file written by rk-wallpaper-picker.py.
-    # shellcheck disable=SC1090
-    . "${CFG_FILE}"
-fi
-
-pkill -x swaybg >/dev/null 2>&1 || true
-
-if [ -n "${WALLPAPER:-}" ] && [ -f "${WALLPAPER}" ]; then
-    swaybg -i "${WALLPAPER}" -m "${MODE:-fill}" >/dev/null 2>&1 &
-else
-    swaybg -c "${FALLBACK_COLOR}" >/dev/null 2>&1 &
-fi
-RK_APPEAR_APPLY
-chmod +x "${ROOTFS_MNT}/usr/local/bin/rk-appearance-apply.sh"
-
-# Wallpaper picker — chooses an image and saves persistent appearance config.
-cat > "${ROOTFS_MNT}/usr/local/bin/rk-wallpaper-picker.py" << 'RK_WALLPICK'
-#!/usr/bin/env python3
-import os
-import shlex
-import subprocess
-
-import gi
-
-gi.require_version("Gtk", "3.0")
-from gi.repository import Gtk
-
-CFG_DIR = os.path.expanduser("~/.config/rkdebian")
-CFG_FILE = os.path.join(CFG_DIR, "appearance.env")
-DEFAULT_MODE = "fill"
-
-
-def _read_existing():
-    mode = DEFAULT_MODE
-    wallpaper = ""
-    if not os.path.exists(CFG_FILE):
-        return wallpaper, mode
-    for raw in open(CFG_FILE, "r", encoding="utf-8", errors="ignore"):
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, val = line.split("=", 1)
-        key = key.strip()
-        val = val.strip().strip('"').strip("'")
-        if key == "WALLPAPER":
-            wallpaper = val
-        elif key == "MODE":
-            mode = val
-    return wallpaper, mode or DEFAULT_MODE
-
-
-def _write_config(path, mode):
-    os.makedirs(CFG_DIR, exist_ok=True)
-    with open(CFG_FILE, "w", encoding="utf-8") as f:
-        f.write("# Autogenerated by rk-wallpaper-picker.py\n")
-        f.write(f"WALLPAPER={shlex.quote(path)}\n")
-        f.write(f"MODE={shlex.quote(mode)}\n")
-
-
-def _file_filter_images():
-    flt = Gtk.FileFilter()
-    flt.set_name("Images")
-    for pat in ("*.png", "*.jpg", "*.jpeg", "*.webp", "*.bmp"):
-        flt.add_pattern(pat)
-        flt.add_pattern(pat.upper())
-    return flt
-
-
-def main():
-    current, mode = _read_existing()
-    dlg = Gtk.FileChooserDialog(
-        title="Choose Wallpaper",
-        action=Gtk.FileChooserAction.OPEN,
-    )
-    dlg.add_buttons(
-        Gtk.STOCK_CANCEL,
-        Gtk.ResponseType.CANCEL,
-        "Apply",
-        Gtk.ResponseType.OK,
-    )
-    dlg.set_local_only(True)
-    dlg.set_modal(True)
-    dlg.set_default_size(900, 620)
-    dlg.set_filter(_file_filter_images())
-    if current and os.path.isfile(current):
-        try:
-            dlg.set_filename(current)
-        except Exception:
-            pass
-    else:
-        pics = os.path.expanduser("~/Pictures")
-        if os.path.isdir(pics):
-            dlg.set_current_folder(pics)
-
-    resp = dlg.run()
-    filename = dlg.get_filename() if resp == Gtk.ResponseType.OK else None
-    dlg.destroy()
-    if not filename:
-        return
-
-    _write_config(filename, mode)
-    subprocess.Popen(["/usr/local/bin/rk-appearance-apply.sh"])
-
-
-if __name__ == "__main__":
-    main()
-RK_WALLPICK
-chmod +x "${ROOTFS_MNT}/usr/local/bin/rk-wallpaper-picker.py"
-
-# waybar configuration (used when waybar is installed)
-mkdir -p "${ROOTFS_MNT}/home/chaos/.config/waybar"
-cat > "${ROOTFS_MNT}/home/chaos/.config/waybar/config" << 'WAYBAR_CFG'
-{
-    "layer": "top",
-    "position": "top",
-    "height": 52,
-    "spacing": 0,
-    "modules-left": ["custom/apps", "custom/store", "custom/wallpaper", "custom/kbd", "custom/close"],
-    "modules-center": ["clock"],
-    "modules-right": ["tray", "custom/bluetooth", "custom/backlight", "pulseaudio", "battery", "network", "custom/power"],
-
-    "custom/apps": {
-        "format": "Apps",
-        "on-click": "/usr/local/bin/rk-launcher.sh",
-        "on-click-touch": "/usr/local/bin/rk-launcher.sh",
-        "tooltip": false,
-        "min-width": 70
-    },
-    "custom/store": {
-        "format": "Store",
-        "on-click": "/usr/local/bin/rk-app-store.sh",
-        "on-click-touch": "/usr/local/bin/rk-app-store.sh",
-        "tooltip": false,
-        "min-width": 76
-    },
-    "custom/wallpaper": {
-        "format": "Wall",
-        "on-click": "/usr/local/bin/rk-wallpaper-picker.py",
-        "on-click-touch": "/usr/local/bin/rk-wallpaper-picker.py",
-        "tooltip": false,
-        "min-width": 66
-    },
-    "custom/kbd": {
-        "format": "kbd",
-        "on-click": "/usr/local/bin/rk-keyboard-toggle.sh",
-        "on-click-touch": "/usr/local/bin/rk-keyboard-toggle.sh",
-        "tooltip": false,
-        "min-width": 60
-    },
-    "custom/close": {
-        "format": "Close",
-        "on-click": "/usr/local/bin/rk-close-action.sh",
-        "on-click-touch": "/usr/local/bin/rk-close-action.sh",
-        "tooltip": false,
-        "min-width": 70
-    },
-    "clock": {
-        "format": "{:%H:%M}",
-        "format-alt": "{:%a %d %b  %H:%M}",
-        "tooltip-format": "{:%A, %d %B %Y}"
-    },
-    "tray": {
-        "spacing": 10,
-        "icon-size": 22
-    },
-    "custom/bluetooth": {
-        "format": "BT",
-        "on-click": "blueman-manager",
-        "on-click-touch": "blueman-manager",
-        "tooltip": false,
-        "min-width": 48
-    },
-    "custom/backlight": {
-        "exec": "echo \"$(brightnessctl get | awk '{printf \"%d\", $1 * 100 / 255}')%☀\"",
-        "interval": 5,
-        "on-click": "WAYLAND_DISPLAY=$WAYLAND_DISPLAY /usr/local/bin/rk-brightness-slider.py",
-        "on-click-touch": "WAYLAND_DISPLAY=$WAYLAND_DISPLAY /usr/local/bin/rk-brightness-slider.py",
-        "tooltip": false
-    },
-    "battery": {
-        "bat": "battery",
-        "interval": 30,
-        "format": "{capacity}%{icon}",
-        "format-charging": "{capacity}%+",
-        "format-icons": ["▁", "▃", "▅", "▇", "█"],
-        "states": { "warning": 20, "critical": 10 },
-        "tooltip": false
-    },
-    "network": {
-        "interval": 15,
-        "format-wifi": "{essid}",
-        "format-disconnected": "no wifi",
-        "tooltip": false
-    },
-    "pulseaudio": {
-        "format": "{volume}%♪",
-        "format-muted": "mute",
-        "on-click": "pavucontrol",
-        "on-click-touch": "pavucontrol",
-        "tooltip": false
-    },
-    "custom/power": {
-        "format": "pwr",
-        "on-click": "/usr/local/bin/rk-power-menu.sh",
-        "on-click-touch": "/usr/local/bin/rk-power-menu.sh",
-        "tooltip": false
-    }
-}
-WAYBAR_CFG
-
-cat > "${ROOTFS_MNT}/home/chaos/.config/waybar/style.css" << 'WAYBAR_CSS'
-* {
-    font-family: "DejaVu Sans", sans-serif;
-    font-size: 13px;
-    min-height: 0;
-    border: none;
-    border-radius: 0;
-    padding: 0;
-    margin: 0;
-}
-
-window#waybar {
-    background-color: #1a1b26;
-    color: #c0caf5;
-    border-bottom: 2px solid #3b4261;
-}
-
-/* Right side modules */
-#clock, #tray, #custom-bluetooth, #custom-backlight, #pulseaudio, #battery, #network, #custom-power {
-    padding: 0 10px;
-    color: #c0caf5;
-}
-
-/* Left action buttons — pill style, clearly separated */
-#custom-apps, #custom-store, #custom-wallpaper, #custom-kbd, #custom-close {
-    padding: 6px 16px;
-    margin: 6px 4px;
-    border-radius: 8px;
-    font-weight: bold;
-    font-size: 14px;
-}
-
-#custom-apps  { background-color: #3d59a1; color: #c0caf5; }
-#custom-store { background-color: #5d6931; color: #d6f2a0; }
-#custom-wallpaper { background-color: #5c4d8e; color: #c0caf5; }
-#custom-kbd   { background-color: #33635c; color: #c0caf5; }
-#custom-close { background-color: #8c3a4a; color: #c0caf5; }
-
-#custom-apps:hover  { background-color: #4e6ab5; }
-#custom-store:hover { background-color: #70823b; }
-#custom-wallpaper:hover { background-color: #6f5fa8; }
-#custom-kbd:hover   { background-color: #3d7a72; }
-#custom-close:hover { background-color: #a34555; }
-
-/* Center clock */
-#clock {
-    font-size: 15px;
-    font-weight: bold;
-    color: #e0af68;
-}
-
-#battery         { color: #9ece6a; }
-#battery.warning { color: #e0af68; }
-#battery.critical{ color: #f7768e; }
-#battery.charging{ color: #73daca; }
-#network         { color: #7dcfff; }
-#pulseaudio      { color: #bb9af7; }
-#custom-bluetooth { color: #8be9fd; font-weight: bold; }
-#custom-backlight { color: #b4f9f8; }
-#custom-power    { color: #f7768e; font-weight: bold; }
-WAYBAR_CSS
-
-# wofi app launcher config — touch-friendly sizing with large icons
-mkdir -p "${ROOTFS_MNT}/home/chaos/.config/wofi"
-cat > "${ROOTFS_MNT}/home/chaos/.config/wofi/config" << 'WOFI_CONFIG'
-allow_images=true
-image_size=64
-single_click=true
-WOFI_CONFIG
-
-cat > "${ROOTFS_MNT}/home/chaos/.config/wofi/style.css" << 'WOFI_CSS'
-window {
-    background-color: #1a1b26;
-    font-family: "DejaVu Sans", sans-serif;
-}
-#input {
-    background-color: #24283b;
-    color: #c0caf5;
-    border: 1px solid #3b4261;
-    border-radius: 8px;
-    padding: 16px 18px;
-    font-size: 20px;
-    margin: 14px;
-    caret-color: #7aa2f7;
-}
-#scroll {
-    margin: 0 8px 8px 8px;
-}
-#inner-box {
-    background-color: transparent;
-}
-#outer-box {
-    background-color: #1a1b26;
-}
-#entry {
-    padding: 16px 8px;
-    color: #c0caf5;
-    font-size: 15px;
-    border-radius: 10px;
-    margin: 6px;
-}
-#entry:selected {
-    background-color: #2a2d3e;
-    color: #7aa2f7;
-}
-#img {
-    margin-bottom: 8px;
-    min-width: 64px;
-    min-height: 64px;
-}
-#text {
-    color: inherit;
-    font-size: 14px;
-    margin-top: 6px;
-}
-WOFI_CSS
-
-# mako notification daemon config
-mkdir -p "${ROOTFS_MNT}/home/chaos/.config/mako"
-cat > "${ROOTFS_MNT}/home/chaos/.config/mako/config" << 'MAKO_CFG'
-font=DejaVu Sans 13
-background-color=#1a1b26
-text-color=#c0caf5
-border-color=#7aa2f7
-border-radius=8
-border-size=2
-width=340
-height=120
-padding=14
-margin=10
-anchor=top-right
-default-timeout=5000
-MAKO_CFG
-
-# Fix ownership of all newly created config dirs to the chaos user.
-chroot "${ROOTFS_MNT}" chown -R chaos:chaos /home/chaos/.config/sway
-chroot "${ROOTFS_MNT}" chown -R chaos:chaos /home/chaos/.config/waybar
-chroot "${ROOTFS_MNT}" chown -R chaos:chaos /home/chaos/.config/wofi
-chroot "${ROOTFS_MNT}" chown -R chaos:chaos /home/chaos/.config/mako
-
-# Wayland env-vars profile — only activates inside a Wayland session.
-# Keeps X11 sessions completely unaffected.
+# Wayland desktop env vars for Plasma sessions.
 cat > "${ROOTFS_MNT}/etc/profile.d/rk-wayland.sh" << 'RK_WAYLAND_PROFILE'
 if [ "${XDG_SESSION_TYPE:-}" = "wayland" ]; then
     export GDK_BACKEND=wayland,x11
@@ -2636,8 +1598,6 @@ if [ "${XDG_SESSION_TYPE:-}" = "wayland" ]; then
     export ELECTRON_OZONE_PLATFORM_HINT=auto
 fi
 RK_WAYLAND_PROFILE
-
-# ── End Wayland / sway section ────────────────────────────────────────────────
 
 # Initialize ALSA controls at boot so speaker/mic paths are sane on RK817.
 echo "[*] Installing ALSA init service..."
@@ -2741,18 +1701,20 @@ cat > "${ROOTFS_MNT}/etc/xdg/autostart/rk-audio-session-fix.desktop" << 'RK_AUDI
 Type=Application
 Name=RK Audio Session Fix
 Exec=/usr/local/bin/rk-audio-session-fix.sh
-OnlyShowIn=XFCE;
+OnlyShowIn=KDE;
 X-GNOME-Autostart-enabled=true
 NoDisplay=true
 RK_AUDIO_SESSION_DESKTOP
 
-# 10. USB OTG service
-if [ -f "${ROOT_DIR}/overlay/usb-mode-switch.sh" ] && [ -f "${ROOT_DIR}/overlay/usb-otg-host.service" ]; then
-    echo "[*] Installing USB OTG service..."
+# 10. USB role manager service (OTG host + charging)
+if [ -f "${ROOT_DIR}/overlay/usb-mode-switch.sh" ] && [ -f "${ROOT_DIR}/overlay/usb-role-manager.service" ]; then
+    echo "[*] Installing USB role manager service..."
     cp "${ROOT_DIR}/overlay/usb-mode-switch.sh" "${ROOTFS_MNT}/usr/local/bin/usb-mode-switch.sh"
     chmod +x "${ROOTFS_MNT}/usr/local/bin/usb-mode-switch.sh"
-    cp "${ROOT_DIR}/overlay/usb-otg-host.service" "${ROOTFS_MNT}/etc/systemd/system/usb-otg-host.service"
-    chroot "${ROOTFS_MNT}" systemctl enable usb-otg-host.service
+    cp "${ROOT_DIR}/overlay/usb-role-manager.service" "${ROOTFS_MNT}/etc/systemd/system/usb-role-manager.service"
+    # Clean up deprecated services that caused one-sided behavior.
+    chroot "${ROOTFS_MNT}" systemctl disable usb-force-host.service usb-otg-host.service >/dev/null 2>&1 || true
+    chroot "${ROOTFS_MNT}" systemctl enable usb-role-manager.service
 fi
 
 # 10b. (removed) rk817-hard-poweroff userspace service was removed.
@@ -2936,7 +1898,7 @@ Description=RK817 battery gauge recovery at boot
 DefaultDependencies=no
 After=local-fs.target systemd-udev-settle.service
 Wants=systemd-udev-settle.service
-Before=display-manager.service lightdm.service
+Before=display-manager.service
 ConditionPathExists=/dev/i2c-0
 ConditionPathExists=/sys/class/power_supply/battery/capacity
 
@@ -3217,7 +2179,7 @@ cat > "${ROOTFS_MNT}/etc/systemd/system/rk-apply-update.service" << 'RK_APPLY_UP
 Description=Apply offline update package from /update/pending or /update
 DefaultDependencies=no
 After=local-fs.target
-Before=multi-user.target lightdm.service graphical.target
+Before=multi-user.target graphical.target
 ConditionPathExists=/usr/local/sbin/rk-apply-update.sh
 
 [Service]

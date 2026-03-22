@@ -52,6 +52,14 @@ The resulting image is written to an SD card. Insert it and power on — the tab
 
 ---
 
+## Known Issues
+
+- Battery may report `0%` after the tablet has been powered off for a couple of hours.
+- `rk-battery-gauge-fix.service` fixes this on boot.
+- If the tablet did not fully power off, reboot once; on the next boot the battery level should be corrected.
+
+---
+
 ## Requirements
 
 **Host machine:** x86-64 Linux (Debian/Ubuntu recommended)
@@ -233,7 +241,7 @@ rkdebian/
 
 ## License
 
-**© cosmo — [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/)**
+**© tech4bot — [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/)**
 
 This project is licensed under the **Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International** license.
 

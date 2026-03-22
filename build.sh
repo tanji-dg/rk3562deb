@@ -86,6 +86,15 @@ setup_dirs() {
     mkdir -p "${OUTPUT_DIR}/update"
 }
 
+run_build_rootfs() {
+    local preserve_env="RKDEBIAN_FORCE_CLEAN_ROOTFS,ROOTFS_IMAGE_SIZE,ROOTFS_HEADROOM_MB,ROOTFS_MIN_MB"
+    if [ "${EUID}" -eq 0 ]; then
+        bash "${ROOT_DIR}/build_rootfs.sh"
+    else
+        sudo --preserve-env="${preserve_env}" bash "${ROOT_DIR}/build_rootfs.sh"
+    fi
+}
+
 build_uboot() {
     echo "[*] Building U-Boot..."
     cd "${SRC_DIR}"
@@ -151,6 +160,22 @@ build_kernel() {
                         git checkout -- "${file}"
                     fi
                 done
+            fi
+        fi
+    fi
+
+    # RK817 hard power-off fix:
+    # force DEV_OFF over SMBus in rk817_shutdown_prepare() to avoid
+    # poweroff->immediate-reboot behavior on this tablet.
+    local rk817_dev_off_patch="${ROOT_DIR}/overlay/kernel-patches/rk817-dev-off-poweroff.patch"
+    if [ -f "${rk817_dev_off_patch}" ]; then
+        if grep -q "shutdown: SYS_CFG3=0x%02x, wrote DEV_OFF" drivers/mfd/rk808.c; then
+            echo "[*] RK817 DEV_OFF shutdown fix already present."
+        else
+            echo "[*] Applying RK817 DEV_OFF shutdown fix..."
+            if ! git apply --whitespace=nowarn "${rk817_dev_off_patch}"; then
+                echo "[-] Error: failed to apply RK817 DEV_OFF shutdown fix."
+                exit 1
             fi
         fi
     fi
@@ -386,7 +411,7 @@ case "${CMD}" in
         build_kernel
         ;;
     rootfs)
-        sudo bash "${ROOT_DIR}/build_rootfs.sh"
+        run_build_rootfs
         ;;
     image)
         create_image
@@ -396,7 +421,7 @@ case "${CMD}" in
         setup_dirs
         build_uboot
         build_kernel
-        sudo bash "${ROOT_DIR}/build_rootfs.sh"
+        run_build_rootfs
         create_image
         create_update_package
         ;;
