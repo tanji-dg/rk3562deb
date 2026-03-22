@@ -1733,16 +1733,11 @@ if [ -f "${ROOT_DIR}/overlay/usb-mode-switch.sh" ] && [ -f "${ROOT_DIR}/overlay/
     chroot "${ROOTFS_MNT}" systemctl enable usb-role-manager.service
 fi
 
-# 10b. RK817 hard power-off fallback hook.
-# Some builds can still reboot immediately on poweroff if PMIC shutdown races.
-# Install a late systemd-shutdown hook that forces RK817 DEV_OFF for poweroff.
-if [ -f "${ROOT_DIR}/overlay/rk817-dev-off.shutdown" ]; then
-    echo "[*] Installing RK817 poweroff fallback hook..."
-    mkdir -p "${ROOTFS_MNT}/usr/lib/systemd/system-shutdown"
-    cp "${ROOT_DIR}/overlay/rk817-dev-off.shutdown" \
-       "${ROOTFS_MNT}/usr/lib/systemd/system-shutdown/rk817-dev-off"
-    chmod 0755 "${ROOTFS_MNT}/usr/lib/systemd/system-shutdown/rk817-dev-off"
-fi
+# 10b. (removed) rk817-hard-poweroff userspace service was removed.
+# The kernel's rk817_battery_shutdown() now saves dsoc/capacity before
+# pm_power_off_prepare runs, and rk817_shutdown_prepare() writes DEV_OFF
+# directly via i2c_smbus.  A userspace service running before systemd-poweroff
+# would kill the PMIC before the kernel can save battery state.
 
 # 10c. Power tuning service (WiFi power-save, CPU governor)
 echo "[*] Installing power tuning service..."
