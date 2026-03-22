@@ -824,6 +824,28 @@ rm -f "${ROOTFS_MNT}/home/chaos/.config/environment.d/90-plasma-x11.conf" \
       "${ROOTFS_MNT}/home/chaos/.config/plasma-org.kde.plasma.desktop-appletsrc" \
       "${ROOTFS_MNT}/home/chaos/.config/plasmashellrc"
 
+# Plasma lockscreen defaults:
+# - avoid phone PIN-style greeter (force Breeze password greeter)
+# - disable automatic locking on idle/resume for tablet usability
+mkdir -p "${ROOTFS_MNT}/home/chaos/.config"
+cat > "${ROOTFS_MNT}/home/chaos/.config/kscreenlockerrc" << 'KSCREENLOCKER_USER'
+[Daemon]
+Autolock=false
+LockOnResume=false
+Timeout=0
+
+[Greeter]
+Theme=org.kde.breeze.desktop
+KSCREENLOCKER_USER
+chroot "${ROOTFS_MNT}" chown chaos:chaos /home/chaos/.config/kscreenlockerrc || true
+
+mkdir -p "${ROOTFS_MNT}/home/chaos/.config/kdedefaults"
+cat > "${ROOTFS_MNT}/home/chaos/.config/kdedefaults/kscreenlockerrc" << 'KSCREENLOCKER_DEFAULTS'
+[Greeter]
+Theme=org.kde.breeze.desktop
+KSCREENLOCKER_DEFAULTS
+chroot "${ROOTFS_MNT}" chown chaos:chaos /home/chaos/.config/kdedefaults/kscreenlockerrc || true
+
 # Prefer Plasma X11 by default.
 PLASMA_SESSION="plasma.desktop"
 PLASMA_DISPLAY_SERVER="x11"
