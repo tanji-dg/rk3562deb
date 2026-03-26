@@ -16,6 +16,8 @@ ROOTFS_MNT="${OUT_DIR}/rootfs"
 MODULES_DIR="${OUT_DIR}/modules_staging/lib/modules"
 RKDEBIAN_DISPLAY_SERVER="${RKDEBIAN_DISPLAY_SERVER:-x11}"
 RKDEBIAN_CPU_GOVERNOR="${RKDEBIAN_CPU_GOVERNOR:-performance}"
+RKDEBIAN_GPU_STACK="${RKDEBIAN_GPU_STACK:-mali}"
+RKDEBIAN_UI_SESSION="${RKDEBIAN_UI_SESSION:-plasma}"
 
 case "${RKDEBIAN_DISPLAY_SERVER}" in
     auto|wayland|x11) ;;
@@ -33,7 +35,24 @@ case "${RKDEBIAN_CPU_GOVERNOR}" in
         ;;
 esac
 
+case "${RKDEBIAN_GPU_STACK}" in
+    mali|panfrost) ;;
+    *)
+        echo "[-] Unsupported RKDEBIAN_GPU_STACK=${RKDEBIAN_GPU_STACK} (expected mali or panfrost)."
+        exit 1
+        ;;
+esac
+
+case "${RKDEBIAN_UI_SESSION}" in
+    plasma|lomiri) ;;
+    *)
+        echo "[-] Unsupported RKDEBIAN_UI_SESSION=${RKDEBIAN_UI_SESSION} (expected plasma or lomiri)."
+        exit 1
+        ;;
+esac
+
 echo "[*] Building Debian 12 Bookworm arm64 rootfs..."
+echo "[*] UI session: ${RKDEBIAN_UI_SESSION} | GPU stack: ${RKDEBIAN_GPU_STACK}"
 
 # Optional: force a fresh debootstrap rootfs to avoid stale package/config
 # carry-over across iterative builds.
@@ -140,6 +159,14 @@ if [ "${plasma_shell_installed}" -ne 1 ]; then
     exit 1
 fi
 
+if [ "${RKDEBIAN_UI_SESSION:-plasma}" = "lomiri" ]; then
+    echo "[*] Installing Lomiri desktop session packages..."
+    apt-get install -y lomiri lomiri-desktop-session
+    # Install Mir platform backends recommended by lomiri on Debian.
+    apt-get install -y mir-platform-graphics-gbm-kms mir-platform-graphics-wayland \
+        mir-platform-graphics-x mir-graphics-drivers-desktop || true
+fi
+
 # Optional Plasma/Mobile helpers.
 # Include Qt virtual keyboard packages so SDDM can show an on-screen keyboard
 # before login on touch-only devices.
@@ -181,6 +208,18 @@ else
     echo "[!] Warning: chromium package not available on current mirror."
 fi
 
+# Reused rootfs trees can carry over emulator/gaming packages from previous
+# experiments. Purge them so mainline desktop images stay clean.
+stale_retro_pkgs="$(
+    dpkg-query -W -f='${Package}\n' | \
+        grep -E '^(retroarch(|-assets)|libretro-.*|dolphin-emu(|-data)|emulationstation(|-dev)?|es-theme-.*|pegasus-frontend(|-.*)?|mupen64plus.*|ppsspp.*|pcsx2.*)$' || true
+)"
+if [ -n "${stale_retro_pkgs}" ]; then
+    echo "[*] Purging stale retro-gaming packages: ${stale_retro_pkgs//$'\n'/ }"
+    apt-get purge -y ${stale_retro_pkgs}
+    apt-get autoremove -y --purge
+fi
+
 # NetworkManager rejects plugin modules unless owned by root.
 find /usr/lib -type f -path '*/NetworkManager/*/libnm-*.so' \
     -exec chown root:root {} + 2>/dev/null || true
@@ -197,6 +236,13 @@ if ! id "chaos" &>/dev/null; then
     echo "chaos:chaos" | chpasswd
 fi
 usermod -aG sudo,video,audio,netdev,render,input chaos
+install -d -m 0755 /etc/sudoers.d
+cat > /etc/sudoers.d/10-chaos-nopasswd << 'SUDOERS_CHAOS'
+chaos ALL=(ALL) NOPASSWD: ALL
+SUDOERS_CHAOS
+chmod 0440 /etc/sudoers.d/10-chaos-nopasswd
+chown root:root /etc/sudoers.d/10-chaos-nopasswd
+visudo -cf /etc/sudoers >/dev/null
 
 # Set root password
 echo "root:root" | chpasswd
@@ -266,8 +312,16 @@ if [ ! -f "${ROOTFS_MNT}/tmp/setup_debian.sh" ]; then
     exit 1
 fi
 # Run through /bin/bash explicitly to avoid direct-exec/shebang edge cases.
-chroot "${ROOTFS_MNT}" /bin/bash /tmp/setup_debian.sh
+chroot "${ROOTFS_MNT}" env RKDEBIAN_UI_SESSION="${RKDEBIAN_UI_SESSION}" /bin/bash /tmp/setup_debian.sh
 rm "${ROOTFS_MNT}/tmp/setup_debian.sh"
+
+# Do not silently continue with Plasma when a Lomiri image was requested.
+if [ "${RKDEBIAN_UI_SESSION}" = "lomiri" ] && \
+   [ ! -f "${ROOTFS_MNT}/usr/share/wayland-sessions/lomiri.desktop" ]; then
+    echo "[-] Error: RKDEBIAN_UI_SESSION=lomiri requested, but lomiri.desktop is missing in rootfs."
+    echo "    Aborting image build to avoid shipping a wrong (Plasma) session."
+    exit 1
+fi
 
 # Ensure privilege-escalation binaries/configs keep root ownership and setuid/setperm bits.
 chroot "${ROOTFS_MNT}" chown root:root /etc/sudo.conf /usr/bin/sudo || true
@@ -302,7 +356,7 @@ if [ -d "${ROOT_DIR}/debs" ]; then
     if compgen -G "${ROOT_DIR}/debs/*.deb" > /dev/null; then
         mkdir -p "${ROOTFS_MNT}/tmp/debs"
         cp "${ROOT_DIR}/debs"/*.deb "${ROOTFS_MNT}/tmp/debs/"
-        if ! chroot "${ROOTFS_MNT}" bash -c '
+        if ! chroot "${ROOTFS_MNT}" env RKDEBIAN_GPU_STACK="${RKDEBIAN_GPU_STACK}" bash -c '
 set -e
 
 # Install non-Mali local packages first.
@@ -311,35 +365,44 @@ if [ -n "${non_mali_debs}" ]; then
     dpkg -i ${non_mali_debs} || apt-get -f install -y
 fi
 
-# Select Mali package priority for current known-good Plasma X11 colors path:
-# g13 x11-gbm -> generic x11-gbm -> x11-wayland-gbm -> wayland-gbm -> any.
-selected_mali_deb=""
-for candidate in \
-    /tmp/debs/libmali*-g13p0*x11-gbm*.deb \
-    /tmp/debs/libmali*-x11-gbm*.deb \
-    /tmp/debs/libmali*-x11-wayland-gbm*.deb \
-    /tmp/debs/libmali*-wayland-gbm*.deb \
-    /tmp/debs/libmali*.deb; do
-    [ -e "${candidate}" ] || continue
-    selected_mali_deb="${candidate}"
-    break
-done
-
-if [ -n "${selected_mali_deb}" ]; then
-    selected_mali_pkg="$(dpkg-deb -f "${selected_mali_deb}" Package)"
-
-    # Ensure only the selected libmali family remains installed.
+# Mesa/Panfrost stack: ensure no libmali userspace package is installed.
+if [ "${RKDEBIAN_GPU_STACK:-mali}" = "panfrost" ]; then
     existing_mali_pkgs="$(dpkg -l | awk '"'"'/^ii/ && $2 ~ /^libmali-/ {print $2}'"'"')"
     if [ -n "${existing_mali_pkgs}" ]; then
         apt-get purge -y ${existing_mali_pkgs}
         apt-get -f install -y
     fi
+else
+    # Select Mali package priority for current known-good Plasma X11 colors path:
+    # g13 x11-gbm -> generic x11-gbm -> x11-wayland-gbm -> wayland-gbm -> any.
+    selected_mali_deb=""
+    for candidate in \
+        /tmp/debs/libmali*-g13p0*x11-gbm*.deb \
+        /tmp/debs/libmali*-x11-gbm*.deb \
+        /tmp/debs/libmali*-x11-wayland-gbm*.deb \
+        /tmp/debs/libmali*-wayland-gbm*.deb \
+        /tmp/debs/libmali*.deb; do
+        [ -e "${candidate}" ] || continue
+        selected_mali_deb="${candidate}"
+        break
+    done
 
-    dpkg -i "${selected_mali_deb}" || apt-get -f install -y
-    if ! dpkg -s "${selected_mali_pkg}" 2>/dev/null | grep -q "^Status: install ok installed$"; then
-        echo "[-] Error: failed to install expected Mali package: ${selected_mali_pkg}"
-        dpkg -l | awk '"'"'/^ii/ && $2 ~ /^libmali-/ {print $2, $3}'"'"' || true
-        exit 1
+    if [ -n "${selected_mali_deb}" ]; then
+        selected_mali_pkg="$(dpkg-deb -f "${selected_mali_deb}" Package)"
+
+        # Ensure only the selected libmali family remains installed.
+        existing_mali_pkgs="$(dpkg -l | awk '"'"'/^ii/ && $2 ~ /^libmali-/ {print $2}'"'"')"
+        if [ -n "${existing_mali_pkgs}" ]; then
+            apt-get purge -y ${existing_mali_pkgs}
+            apt-get -f install -y
+        fi
+
+        dpkg -i "${selected_mali_deb}" || apt-get -f install -y
+        if ! dpkg -s "${selected_mali_pkg}" 2>/dev/null | grep -q "^Status: install ok installed$"; then
+            echo "[-] Error: failed to install expected Mali package: ${selected_mali_pkg}"
+            dpkg -l | awk '"'"'/^ii/ && $2 ~ /^libmali-/ {print $2, $3}'"'"' || true
+            exit 1
+        fi
     fi
 fi
         '; then
@@ -353,35 +416,47 @@ fi
     fi
 fi
 
-# 5b. Keep Mesa GBM fallback, and make Mali GBM path use Debian libgbm.
-# Some Mali blobs ship an old libgbm missing gbm_bo_create_with_modifiers2,
-# which causes KWin/Plasma startup failures.
-if compgen -G "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/mali/libmali*.so" > /dev/null || \
-   [ -e "${ROOTFS_MNT}/lib/aarch64-linux-gnu/libmali.so.1" ] || \
-   [ -e "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/libmali.so.1" ] || \
-   [ -e "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/mali/libgbm.so.1" ]; then
-    echo "[*] Preserving Mesa EGL fallback and fixing Mali libgbm path..."
-
-    # Force the Mali libgbm path to resolve to Debian's libgbm implementation.
-    if [ -e "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/libgbm.so.1" ]; then
-        mali_gbm_backup="${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/mali/.libgbm.so.1.rkbak"
-        if [ -e "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/mali/libgbm.so.1" ] && \
-           [ ! -e "${mali_gbm_backup}" ]; then
-            cp -a "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/mali/libgbm.so.1" \
-                  "${mali_gbm_backup}"
-        fi
-        # Drop legacy backup names that match lib*.so*; ldconfig can relink
-        # libgbm.so.1 back to them and undo the intended Debian libgbm pin.
-        rm -f "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/mali/libgbm.so.1.rkbak"
-        ln -sfn /usr/lib/aarch64-linux-gnu/libgbm.so.1 \
-                "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/mali/libgbm.so.1"
-        ln -sfn libgbm.so.1 \
-                "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/mali/libgbm.so"
-    fi
-
+# 5b. Finalize GPU userspace stack.
+if [ "${RKDEBIAN_GPU_STACK}" = "panfrost" ]; then
+    echo "[*] Finalizing Mesa/Panfrost userspace stack..."
+    rm -rf "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/mali"
+    rm -f "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/libmali.so" \
+          "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/libmali.so.1" \
+          "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/libmali-hook.so" \
+          "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/libmali-hook.so.1" \
+          "${ROOTFS_MNT}/etc/ld.so.conf.d/00-aarch64-mali.conf"
     chroot "${ROOTFS_MNT}" ldconfig
 else
-    echo "[!] Warning: Mali userspace package not detected; skipping Mesa cleanup."
+    # Keep Mesa GBM fallback, and make Mali GBM path use Debian libgbm.
+    # Some Mali blobs ship an old libgbm missing gbm_bo_create_with_modifiers2,
+    # which causes KWin/Plasma startup failures.
+    if compgen -G "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/mali/libmali*.so" > /dev/null || \
+       [ -e "${ROOTFS_MNT}/lib/aarch64-linux-gnu/libmali.so.1" ] || \
+       [ -e "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/libmali.so.1" ] || \
+       [ -e "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/mali/libgbm.so.1" ]; then
+        echo "[*] Preserving Mesa EGL fallback and fixing Mali libgbm path..."
+
+        # Force the Mali libgbm path to resolve to Debian's libgbm implementation.
+        if [ -e "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/libgbm.so.1" ]; then
+            mali_gbm_backup="${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/mali/.libgbm.so.1.rkbak"
+            if [ -e "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/mali/libgbm.so.1" ] && \
+               [ ! -e "${mali_gbm_backup}" ]; then
+                cp -a "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/mali/libgbm.so.1" \
+                      "${mali_gbm_backup}"
+            fi
+            # Drop legacy backup names that match lib*.so*; ldconfig can relink
+            # libgbm.so.1 back to them and undo the intended Debian libgbm pin.
+            rm -f "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/mali/libgbm.so.1.rkbak"
+            ln -sfn /usr/lib/aarch64-linux-gnu/libgbm.so.1 \
+                    "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/mali/libgbm.so.1"
+            ln -sfn libgbm.so.1 \
+                    "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/mali/libgbm.so"
+        fi
+
+        chroot "${ROOTFS_MNT}" ldconfig
+    else
+        echo "[!] Warning: Mali userspace package not detected; skipping Mali-specific GBM setup."
+    fi
 fi
 
 # 6. Install WiFi/BT firmware
@@ -828,13 +903,23 @@ fi
 echo "[*] Setting hostname and fstab..."
 echo "rk3562-debian" > "${ROOTFS_MNT}/etc/hostname"
 
+# Record the requested build profile inside the rootfs for post-flash checks.
+cat > "${ROOTFS_MNT}/etc/rkdebian-build-profile" << PROFILE_EOF
+BUILD_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+RKDEBIAN_UI_SESSION=${RKDEBIAN_UI_SESSION}
+RKDEBIAN_DISPLAY_SERVER=${RKDEBIAN_DISPLAY_SERVER}
+RKDEBIAN_GPU_STACK=${RKDEBIAN_GPU_STACK}
+RKDEBIAN_CPU_GOVERNOR=${RKDEBIAN_CPU_GOVERNOR}
+RKDEBIAN_FORCE_CLEAN_ROOTFS=${RKDEBIAN_FORCE_CLEAN_ROOTFS:-0}
+PROFILE_EOF
+
 cat > "${ROOTFS_MNT}/etc/fstab" << 'FSTAB'
 # <file system>  <mount point>  <type>  <options>        <dump>  <pass>
 PARTUUID=c0ffee11-2233-4455-6677-8899aabbccdd  /  ext4  defaults,noatime  0  1
 FSTAB
 
-# 9. Configure SDDM autologin for Plasma
-echo "[*] Configuring SDDM autologin..."
+# 9. Configure SDDM autologin
+echo "[*] Configuring SDDM autologin (${RKDEBIAN_UI_SESSION})..."
 mkdir -p "${ROOTFS_MNT}/etc/sddm.conf.d"
 rm -rf "${ROOTFS_MNT}/etc/lightdm"
 # Reused rootfs trees can retain a text-mode default target from prior
@@ -887,29 +972,46 @@ find_plasma_session() {
     return 1
 }
 
-PLASMA_SESSION_INFO="$(find_plasma_session "${RKDEBIAN_DISPLAY_SERVER}" || true)"
-if [ -z "${PLASMA_SESSION_INFO}" ] && [ "${RKDEBIAN_DISPLAY_SERVER}" != "auto" ]; then
-    echo "[!] Warning: requested ${RKDEBIAN_DISPLAY_SERVER} Plasma session not found; falling back to auto."
-    PLASMA_SESSION_INFO="$(find_plasma_session auto || true)"
+SDDM_SESSION=""
+SDDM_DISPLAY_SERVER="x11"
+if [ "${RKDEBIAN_UI_SESSION}" = "lomiri" ]; then
+    if [ -f "${ROOTFS_MNT}/usr/share/wayland-sessions/lomiri.desktop" ]; then
+        SDDM_SESSION="lomiri.desktop"
+    else
+        echo "[-] Error: RKDEBIAN_UI_SESSION=lomiri requested but lomiri.desktop is missing."
+        echo "    Refusing to fall back to Plasma for this build."
+        exit 1
+    fi
 fi
 
-if [ -n "${PLASMA_SESSION_INFO}" ]; then
-    PLASMA_DISPLAY_SERVER="${PLASMA_SESSION_INFO%%:*}"
-    PLASMA_SESSION="${PLASMA_SESSION_INFO#*:}"
+if [ -z "${SDDM_SESSION}" ]; then
+    PLASMA_SESSION_INFO="$(find_plasma_session "${RKDEBIAN_DISPLAY_SERVER}" || true)"
+    if [ -z "${PLASMA_SESSION_INFO}" ] && [ "${RKDEBIAN_DISPLAY_SERVER}" != "auto" ]; then
+        echo "[!] Warning: requested ${RKDEBIAN_DISPLAY_SERVER} Plasma session not found; falling back to auto."
+        PLASMA_SESSION_INFO="$(find_plasma_session auto || true)"
+    fi
+
+    if [ -n "${PLASMA_SESSION_INFO}" ]; then
+        SDDM_DISPLAY_SERVER="${PLASMA_SESSION_INFO%%:*}"
+        SDDM_SESSION="${PLASMA_SESSION_INFO#*:}"
+    else
+        SDDM_DISPLAY_SERVER="x11"
+        SDDM_SESSION="plasma.desktop"
+        echo "[!] Warning: no Plasma session desktop file detected; defaulting to ${SDDM_SESSION}."
+    fi
 else
-    PLASMA_DISPLAY_SERVER="x11"
-    PLASMA_SESSION="plasma.desktop"
-    echo "[!] Warning: no Plasma session desktop file detected; defaulting to ${PLASMA_SESSION}."
+    # Keep SDDM on X11 for maximum compatibility. Lomiri itself runs a Mir/Wayland session.
+    SDDM_DISPLAY_SERVER="x11"
 fi
 
 cat > "${ROOTFS_MNT}/etc/sddm.conf.d/10-rk-autologin.conf" << SDDM_AUTLOGIN
 [Autologin]
 User=chaos
-Session=${PLASMA_SESSION}
+Session=${SDDM_SESSION}
 Relogin=false
 
 [General]
-DisplayServer=${PLASMA_DISPLAY_SERVER}
+DisplayServer=${SDDM_DISPLAY_SERVER}
 SDDM_AUTLOGIN
 
 # Stale user-unit symlinks from old sway-focused rootfs trees can trigger
@@ -923,12 +1025,28 @@ InputMethod=qtvirtualkeyboard
 GreeterEnvironment=QT_IM_MODULE=qtvirtualkeyboard
 SDDM_VK
 
+# Export the Maliit input method globally so Lomiri and Plasma both pick up
+# the same Qt/GTK keyboard plugin wiring.
+mkdir -p "${ROOTFS_MNT}/etc/environment.d" "${ROOTFS_MNT}/etc/profile.d"
+cat > "${ROOTFS_MNT}/etc/environment.d/90-rkdebian-inputmethod.conf" << 'IM_ENV_SYSTEM'
+GTK_IM_MODULE=Maliit
+QT_IM_MODULE=maliitphablet
+XMODIFIERS=@im=none
+IM_ENV_SYSTEM
+cat > "${ROOTFS_MNT}/etc/profile.d/90-rkdebian-maliit.sh" << 'IM_PROFILE'
+#!/bin/sh
+export GTK_IM_MODULE=Maliit
+export QT_IM_MODULE=maliitphablet
+export XMODIFIERS=@im=none
+IM_PROFILE
+chmod +x "${ROOTFS_MNT}/etc/profile.d/90-rkdebian-maliit.sh"
+
 # Auto-show Maliit keyboard in Plasma sessions (Qt + GTK apps).
 mkdir -p "${ROOTFS_MNT}/home/chaos/.config/plasma-workspace/env"
 cat > "${ROOTFS_MNT}/home/chaos/.config/plasma-workspace/env/90-inputmethod.sh" << 'IM_ENV'
 #!/bin/sh
 export GTK_IM_MODULE=Maliit
-export QT_IM_MODULE=MaliitPhablet
+export QT_IM_MODULE=maliitphablet
 export XMODIFIERS=@im=none
 IM_ENV
 chmod +x "${ROOTFS_MNT}/home/chaos/.config/plasma-workspace/env/90-inputmethod.sh"
@@ -946,6 +1064,114 @@ X-GNOME-Autostart-enabled=true
 NoDisplay=true
 MALIIT_AUTOSTART
 chroot "${ROOTFS_MNT}" chown chaos:chaos /home/chaos/.config/autostart/maliit-server.desktop || true
+
+if [ "${RKDEBIAN_UI_SESSION}" = "lomiri" ]; then
+mkdir -p "${ROOTFS_MNT}/etc/systemd/user/graphical-session.target.wants" \
+         "${ROOTFS_MNT}/etc/lomiri" \
+         "${ROOTFS_MNT}/etc/dconf/profile" \
+         "${ROOTFS_MNT}/etc/dconf/db/local.d"
+
+cat > "${ROOTFS_MNT}/etc/systemd/user/rk-lomiri-maliit-server.service" << 'LOMIRI_MALIIT'
+[Unit]
+Description=RKDEBIAN Maliit input method for Lomiri
+PartOf=graphical-session.target
+After=dbus.socket lomiri.service
+Requires=dbus.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/maliit-server
+Restart=on-failure
+
+[Install]
+WantedBy=graphical-session.target
+LOMIRI_MALIIT
+ln -sf /etc/systemd/user/rk-lomiri-maliit-server.service \
+    "${ROOTFS_MNT}/etc/systemd/user/graphical-session.target.wants/rk-lomiri-maliit-server.service"
+
+LOMIRI_POLKIT_AGENT=""
+if [ -x "${ROOTFS_MNT}/usr/lib/policykit-1-gnome/polkit-gnome-authentication-agent-1" ]; then
+    LOMIRI_POLKIT_AGENT="/usr/lib/policykit-1-gnome/polkit-gnome-authentication-agent-1"
+elif [ -x "${ROOTFS_MNT}/usr/libexec/polkit-mate-authentication-agent-1" ]; then
+    LOMIRI_POLKIT_AGENT="/usr/libexec/polkit-mate-authentication-agent-1"
+fi
+
+if [ -n "${LOMIRI_POLKIT_AGENT}" ]; then
+cat > "${ROOTFS_MNT}/etc/systemd/user/rk-lomiri-polkit-agent.service" << LOMIRI_POLKIT
+[Unit]
+Description=RKDEBIAN PolicyKit agent for Lomiri
+PartOf=graphical-session.target
+After=dbus.socket lomiri.service
+Requires=dbus.socket
+
+[Service]
+Type=simple
+ExecStart=${LOMIRI_POLKIT_AGENT}
+Restart=on-failure
+
+[Install]
+WantedBy=graphical-session.target
+LOMIRI_POLKIT
+ln -sf /etc/systemd/user/rk-lomiri-polkit-agent.service \
+    "${ROOTFS_MNT}/etc/systemd/user/graphical-session.target.wants/rk-lomiri-polkit-agent.service"
+else
+    echo "[!] Warning: no graphical polkit agent found for Lomiri session."
+fi
+
+cat > "${ROOTFS_MNT}/etc/lomiri/devices.conf" << 'LOMIRI_DEVICES'
+# Force this RK3562 tablet into a touch-first landscape shell until the
+# accelerometer/orientation path is fully validated in Lomiri.
+[rk3562-debian]
+SupportedOrientations=Landscape,InvertedLandscape
+PrimaryOrientation=Landscape
+LandscapeOrientation=Landscape
+InvertedLandscapeOrientation=InvertedLandscape
+PortraitOrientation=Portrait
+InvertedPortraitOrientation=InvertedPortrait
+Category=tablet
+
+[rk3562-rk817-tablet]
+SupportedOrientations=Landscape,InvertedLandscape
+PrimaryOrientation=Landscape
+LandscapeOrientation=Landscape
+InvertedLandscapeOrientation=InvertedLandscape
+PortraitOrientation=Portrait
+InvertedPortraitOrientation=InvertedPortrait
+Category=tablet
+
+[rockchip,rk3562-rk817-tablet]
+SupportedOrientations=Landscape,InvertedLandscape
+PrimaryOrientation=Landscape
+LandscapeOrientation=Landscape
+InvertedLandscapeOrientation=InvertedLandscape
+PortraitOrientation=Portrait
+InvertedPortraitOrientation=InvertedPortrait
+Category=tablet
+
+[Rockchip RK3562 RK817 TABLET LP4 Board]
+SupportedOrientations=Landscape,InvertedLandscape
+PrimaryOrientation=Landscape
+LandscapeOrientation=Landscape
+InvertedLandscapeOrientation=InvertedLandscape
+PortraitOrientation=Portrait
+InvertedPortraitOrientation=InvertedPortrait
+Category=tablet
+LOMIRI_DEVICES
+
+cat > "${ROOTFS_MNT}/etc/dconf/profile/user" << 'DCONF_PROFILE'
+user-db:user
+system-db:local
+DCONF_PROFILE
+cat > "${ROOTFS_MNT}/etc/dconf/db/local.d/00-rkdebian-lomiri" << 'DCONF_LOMIRI'
+[com/lomiri/shell]
+always-show-osk=true
+
+[org/maliit/keyboard/maliit]
+device='tablet'
+stay-hidden=false
+DCONF_LOMIRI
+chroot "${ROOTFS_MNT}" dconf update || true
+fi
 
 # Prevent duplicate/competing keyboards when reusing an old rootfs tree.
 cat > "${ROOTFS_MNT}/home/chaos/.config/autostart/onboard.desktop" << 'ONBOARD_HIDE'
@@ -1971,6 +2197,73 @@ TimeoutSec=10
 WantedBy=multi-user.target
 RK_BAT_GAUGE_FIX_UNIT
 chroot "${ROOTFS_MNT}" systemctl enable rk-battery-gauge-fix.service
+
+# 10e. Session failsafe watchdog (auto-rollback for risky session tests).
+echo "[*] Installing session failsafe watchdog..."
+cat > "${ROOTFS_MNT}/usr/local/sbin/rk-session-failsafe.sh" << 'RK_SESSION_FAILSAFE'
+#!/bin/sh
+set -eu
+
+STATE_DIR=/var/lib/rk-session-failsafe
+ARMED_FILE="${STATE_DIR}/armed"
+[ -f "${ARMED_FILE}" ] || exit 0
+
+session_file=/etc/sddm.conf.d/10-rk-autologin.conf
+if [ -f "${session_file}" ] && grep -q '^Session=lomiri.desktop$' "${session_file}"; then
+    if loginctl list-sessions --no-legend 2>/dev/null | awk '$3=="chaos"{found=1} END{exit(found?0:1)}'; then
+        if pgrep -u chaos -f '/usr/bin/lomiri' >/dev/null 2>&1 || \
+           pgrep -u chaos -f 'dm-lomiri-session' >/dev/null 2>&1 || \
+           pgrep -u chaos -f 'lomiri-session' >/dev/null 2>&1; then
+            rm -f "${ARMED_FILE}"
+            logger -t rk-session-failsafe "Lomiri session detected; disarmed watchdog without rollback"
+            exit 0
+        fi
+    fi
+fi
+
+install -d /etc/sddm.conf.d /etc/X11 /etc/systemd/system
+cat > /etc/sddm.conf.d/10-rk-autologin.conf << 'AUTLOGIN'
+[Autologin]
+User=chaos
+Session=plasma.desktop
+Relogin=false
+AUTLOGIN
+rm -f /etc/lightdm/lightdm.conf.d/50-rk-autologin.conf
+printf '%s\n' '/usr/bin/sddm' > /etc/X11/default-display-manager
+ln -sfn /lib/systemd/system/sddm.service /etc/systemd/system/display-manager.service
+systemctl disable lightdm >/dev/null 2>&1 || true
+systemctl enable sddm >/dev/null 2>&1 || true
+rm -f "${ARMED_FILE}"
+logger -t rk-session-failsafe "Rollback to plasma triggered; rebooting"
+systemctl --no-block reboot
+RK_SESSION_FAILSAFE
+chmod +x "${ROOTFS_MNT}/usr/local/sbin/rk-session-failsafe.sh"
+
+cat > "${ROOTFS_MNT}/etc/systemd/system/rk-session-failsafe.service" << 'RK_SESSION_FAILSAFE_UNIT'
+[Unit]
+Description=Rollback tablet display manager if Lomiri test is still armed
+ConditionPathExists=/var/lib/rk-session-failsafe/armed
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/rk-session-failsafe.sh
+RK_SESSION_FAILSAFE_UNIT
+
+cat > "${ROOTFS_MNT}/etc/systemd/system/rk-session-failsafe.timer" << 'RK_SESSION_FAILSAFE_TIMER'
+[Unit]
+Description=Run tablet display-manager failsafe 5 minutes after boot
+
+[Timer]
+OnBootSec=5min
+Unit=rk-session-failsafe.service
+
+[Install]
+WantedBy=timers.target
+RK_SESSION_FAILSAFE_TIMER
+
+mkdir -p "${ROOTFS_MNT}/var/lib/rk-session-failsafe"
+chroot "${ROOTFS_MNT}" systemctl enable rk-session-failsafe.timer
 
 # 11. Offline update package auto-apply service
 echo "[*] Installing offline update auto-apply service..."

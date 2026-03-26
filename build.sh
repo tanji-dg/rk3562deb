@@ -22,11 +22,187 @@ RKBIN_BRANCH="master"
 UBOOT_DEFCONFIG="rk3562_defconfig"
 KERNEL_DEFCONFIG="rockchip_linux_defconfig"
 KERNEL_DTB="rk3562-rk817-tablet-v10.dtb"
+RKDEBIAN_DISPLAY_SERVER="${RKDEBIAN_DISPLAY_SERVER:-x11}"
+RKDEBIAN_UI_SESSION="${RKDEBIAN_UI_SESSION:-plasma}"
+RKDEBIAN_GPU_STACK="${RKDEBIAN_GPU_STACK:-mali}"
+RKDEBIAN_CPU_GOVERNOR="${RKDEBIAN_CPU_GOVERNOR:-performance}"
+RKDEBIAN_FORCE_CLEAN_ROOTFS="${RKDEBIAN_FORCE_CLEAN_ROOTFS:-0}"
 
 CROSS_COMPILE="aarch64-linux-gnu-"
-MAKE_THREADS=$(nproc)
+CPU_THREADS=$(nproc)
+MEM_THREADS=$CPU_THREADS
+if [ -r /proc/meminfo ]; then
+    mem_total_kb=$(awk '/MemTotal:/ {print $2}' /proc/meminfo)
+    # Keep kernel compile parallelism memory-safe on low-RAM hosts.
+    # Roughly budget ~2 GiB per compile job to avoid random cc1 terminations.
+    if [ -n "${mem_total_kb}" ] && [ "${mem_total_kb}" -gt 0 ] 2>/dev/null; then
+        MEM_THREADS=$((mem_total_kb / 1024 / 1024 / 2))
+        [ "${MEM_THREADS}" -lt 1 ] && MEM_THREADS=1
+    fi
+fi
+if [ "${MEM_THREADS}" -lt "${CPU_THREADS}" ]; then
+    DEFAULT_MAKE_THREADS="${MEM_THREADS}"
+else
+    DEFAULT_MAKE_THREADS="${CPU_THREADS}"
+fi
+MAKE_THREADS="${RKDEBIAN_MAKE_THREADS:-${DEFAULT_MAKE_THREADS}}"
+case "${MAKE_THREADS}" in
+    ''|*[!0-9]*) MAKE_THREADS="${DEFAULT_MAKE_THREADS}" ;;
+esac
+[ "${MAKE_THREADS}" -lt 1 ] && MAKE_THREADS=1
 
 echo "=== RK3562 Debian 12 Builder ==="
+
+usage() {
+    cat <<'EOF'
+Usage: ./build.sh [options] {check|lunch|uboot|extboot|updateimg|updatepkg|compile|rootfs|image|all}
+
+Options:
+  --ui-session {plasma|lomiri}
+  --gpu-stack {mali|panfrost}
+  --display-server {auto|wayland|x11}
+  --cpu-governor VALUE
+  --force-clean-rootfs
+  --no-force-clean-rootfs
+  -h, --help
+EOF
+}
+
+parse_args() {
+    local argv=()
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --ui-session)
+                [ "$#" -ge 2 ] || { echo "[-] Error: --ui-session requires a value."; exit 1; }
+                RKDEBIAN_UI_SESSION="$2"
+                shift 2
+                ;;
+            --ui-session=*)
+                RKDEBIAN_UI_SESSION="${1#*=}"
+                shift
+                ;;
+            --gpu-stack)
+                [ "$#" -ge 2 ] || { echo "[-] Error: --gpu-stack requires a value."; exit 1; }
+                RKDEBIAN_GPU_STACK="$2"
+                shift 2
+                ;;
+            --gpu-stack=*)
+                RKDEBIAN_GPU_STACK="${1#*=}"
+                shift
+                ;;
+            --display-server)
+                [ "$#" -ge 2 ] || { echo "[-] Error: --display-server requires a value."; exit 1; }
+                RKDEBIAN_DISPLAY_SERVER="$2"
+                shift 2
+                ;;
+            --display-server=*)
+                RKDEBIAN_DISPLAY_SERVER="${1#*=}"
+                shift
+                ;;
+            --cpu-governor)
+                [ "$#" -ge 2 ] || { echo "[-] Error: --cpu-governor requires a value."; exit 1; }
+                RKDEBIAN_CPU_GOVERNOR="$2"
+                shift 2
+                ;;
+            --cpu-governor=*)
+                RKDEBIAN_CPU_GOVERNOR="${1#*=}"
+                shift
+                ;;
+            --force-clean-rootfs)
+                RKDEBIAN_FORCE_CLEAN_ROOTFS=1
+                shift
+                ;;
+            --no-force-clean-rootfs)
+                RKDEBIAN_FORCE_CLEAN_ROOTFS=0
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            --)
+                shift
+                while [ "$#" -gt 0 ]; do
+                    argv+=("$1")
+                    shift
+                done
+                ;;
+            -*)
+                echo "[-] Error: unknown option: $1"
+                usage
+                exit 1
+                ;;
+            *)
+                argv+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    set -- "${argv[@]}"
+    CMD="${1:-all}"
+}
+
+parse_args "$@"
+
+export RKDEBIAN_DISPLAY_SERVER
+export RKDEBIAN_UI_SESSION
+export RKDEBIAN_GPU_STACK
+export RKDEBIAN_CPU_GOVERNOR
+export RKDEBIAN_FORCE_CLEAN_ROOTFS
+
+echo "[*] Build profile: session=${RKDEBIAN_UI_SESSION} gpu=${RKDEBIAN_GPU_STACK} display=${RKDEBIAN_DISPLAY_SERVER} clean_rootfs=${RKDEBIAN_FORCE_CLEAN_ROOTFS}"
+
+case "${RKDEBIAN_DISPLAY_SERVER}" in
+    auto|wayland|x11) ;;
+    *)
+        echo "[-] Error: unsupported RKDEBIAN_DISPLAY_SERVER=${RKDEBIAN_DISPLAY_SERVER} (expected auto, wayland, or x11)."
+        exit 1
+        ;;
+esac
+
+case "${RKDEBIAN_UI_SESSION}" in
+    plasma|lomiri) ;;
+    *)
+        echo "[-] Error: unsupported RKDEBIAN_UI_SESSION=${RKDEBIAN_UI_SESSION} (expected plasma or lomiri)."
+        exit 1
+        ;;
+esac
+
+case "${RKDEBIAN_GPU_STACK}" in
+    mali|panfrost) ;;
+    *)
+        echo "[-] Error: unsupported RKDEBIAN_GPU_STACK=${RKDEBIAN_GPU_STACK} (expected mali or panfrost)."
+        exit 1
+        ;;
+esac
+
+verify_rootfs_profile() {
+    local profile_file="${OUT_DIR}/rootfs/etc/rkdebian-build-profile"
+    if [ ! -f "${profile_file}" ]; then
+        echo "[-] Error: missing ${profile_file}; refusing to package an unverified rootfs."
+        exit 1
+    fi
+
+    if ! grep -qx "RKDEBIAN_UI_SESSION=${RKDEBIAN_UI_SESSION}" "${profile_file}"; then
+        echo "[-] Error: rootfs session profile does not match requested value (${RKDEBIAN_UI_SESSION})."
+        cat "${profile_file}"
+        exit 1
+    fi
+
+    if ! grep -qx "RKDEBIAN_GPU_STACK=${RKDEBIAN_GPU_STACK}" "${profile_file}"; then
+        echo "[-] Error: rootfs GPU profile does not match requested value (${RKDEBIAN_GPU_STACK})."
+        cat "${profile_file}"
+        exit 1
+    fi
+
+    if [ "${RKDEBIAN_UI_SESSION}" = "lomiri" ] && \
+       [ ! -f "${OUT_DIR}/rootfs/usr/share/wayland-sessions/lomiri.desktop" ]; then
+        echo "[-] Error: lomiri.desktop is missing from the rootfs."
+        exit 1
+    fi
+}
 
 ensure_sdk_compat_layout() {
     mkdir -p "${ROOT_DIR}/app" "${ROOT_DIR}/buildroot" "${ROOT_DIR}/device" \
@@ -84,10 +260,50 @@ setup_dirs() {
     mkdir -p "${OUT_DIR}/boot"
     mkdir -p "${OUT_DIR}/rootfs"
     mkdir -p "${OUTPUT_DIR}/update"
+
+    if [ "${EUID}" -ne 0 ]; then
+        local repair_outputs=0
+        local foreign_output=""
+
+        if [ ! -w "${OUT_DIR}" ] || [ ! -w "${OUT_DIR}/boot" ] || [ ! -w "${OUTPUT_DIR}" ]; then
+            repair_outputs=1
+        else
+            foreign_output=$(find "${OUT_DIR}" "${OUTPUT_DIR}" -mindepth 1 \
+                \( ! -uid "$(id -u)" -o ! -gid "$(id -g)" \) -print -quit 2>/dev/null || true)
+            [ -n "${foreign_output}" ] && repair_outputs=1
+        fi
+
+        if [ "${repair_outputs}" -eq 1 ]; then
+            echo "[*] Fixing ownership of output directories..."
+            if ! sudo chown -R "$(id -u):$(id -g)" "${OUT_DIR}" "${OUTPUT_DIR}"; then
+                echo "[-] Error: output directories are not writable and ownership fix failed."
+                echo "    Please run: sudo chown -R $(id -u):$(id -g) ${OUT_DIR} ${OUTPUT_DIR}"
+                exit 1
+            fi
+        fi
+    fi
+}
+
+sanitize_kbuild_cmd_files() {
+    local kernel_tree="${1:-.}"
+    local bad_cmd_files=()
+
+    while IFS= read -r file; do
+        bad_cmd_files+=("${file}")
+    done < <(
+        find "${kernel_tree}" -type f -name '.*.cmd' -print0 2>/dev/null \
+            | xargs -0 -r awk '/\$\(wildcard[^)]*$/ { print FILENAME; nextfile }' 2>/dev/null \
+            | sort -u
+    )
+
+    if [ "${#bad_cmd_files[@]}" -gt 0 ]; then
+        echo "[!] Found ${#bad_cmd_files[@]} malformed kbuild .cmd file(s); removing stale metadata..."
+        rm -f "${bad_cmd_files[@]}"
+    fi
 }
 
 run_build_rootfs() {
-    local preserve_env="RKDEBIAN_FORCE_CLEAN_ROOTFS,ROOTFS_IMAGE_SIZE,ROOTFS_HEADROOM_MB,ROOTFS_MIN_MB,RKDEBIAN_DISPLAY_SERVER"
+    local preserve_env="RKDEBIAN_FORCE_CLEAN_ROOTFS,ROOTFS_IMAGE_SIZE,ROOTFS_HEADROOM_MB,ROOTFS_MIN_MB,RKDEBIAN_DISPLAY_SERVER,RKDEBIAN_GPU_STACK,RKDEBIAN_UI_SESSION,RKDEBIAN_CPU_GOVERNOR"
     if [ "${EUID}" -eq 0 ]; then
         bash "${ROOT_DIR}/build_rootfs.sh"
     else
@@ -108,6 +324,15 @@ build_uboot() {
     fi
     
     cd u-boot
+
+    if [ "${EUID}" -ne 0 ]; then
+        local foreign_owner=""
+        foreign_owner=$(find . -maxdepth 3 \( ! -uid "$(id -u)" -o ! -gid "$(id -g)" \) -print -quit 2>/dev/null || true)
+        if [ -n "${foreign_owner}" ]; then
+            echo "[*] Repairing U-Boot tree ownership..."
+            sudo chown -R "$(id -u):$(id -g)" .
+        fi
+    fi
     
     export KCFLAGS="-Wno-error"
     ABS_CROSS_COMPILE=$(dirname $(command -v aarch64-linux-gnu-gcc))"/aarch64-linux-gnu-"
@@ -138,9 +363,32 @@ build_kernel() {
 
     cd kernel
 
+    if [ "${EUID}" -ne 0 ]; then
+        local foreign_owner=""
+        foreign_owner=$(find . -maxdepth 4 \( ! -uid "$(id -u)" -o ! -gid "$(id -g)" \) -print -quit 2>/dev/null || true)
+        if [ -n "${foreign_owner}" ]; then
+            echo "[*] Repairing kernel tree ownership..."
+            sudo chown -R "$(id -u):$(id -g)" .
+        fi
+    fi
+
+    echo "[*] Kernel parallel jobs: ${MAKE_THREADS} (cpu=${CPU_THREADS}, mem-cap=${MEM_THREADS})"
+    sanitize_kbuild_cmd_files "."
+
     # Apply local overlay (custom drivers, defconfig, DTS, firmware) if existing
     if [ -d "${ROOT_DIR}/overlay" ]; then
         cp -r "${ROOT_DIR}/overlay/." .
+
+        if [ "${RKDEBIAN_GPU_STACK}" = "panfrost" ]; then
+            local panfrost_dts="arch/arm64/boot/dts/rockchip/rk3562-rk817-tablet-v10-panfrost.dts"
+            local active_dts="arch/arm64/boot/dts/rockchip/rk3562-rk817-tablet-v10.dts"
+            if [ -f "${panfrost_dts}" ]; then
+                cp -f "${panfrost_dts}" "${active_dts}"
+                echo "[*] GPU stack=panfrost: using panfrost-friendly tablet DTS overrides."
+            else
+                echo "[!] Warning: ${panfrost_dts} not found; keeping default tablet DTS."
+            fi
+        fi
 
         if [ -d .git ]; then
             local pmic_overlay_files=(
@@ -231,6 +479,33 @@ build_kernel() {
         scripts/config --enable FRAMEBUFFER_CONSOLE || true
         scripts/config --enable LOGO || true
         scripts/config --enable LOGO_LINUX_CLUT224 || true
+
+        if [ "${RKDEBIAN_GPU_STACK}" = "panfrost" ]; then
+            echo "[*] Applying panfrost kernel config overrides..."
+            scripts/config --enable DRM_PANFROST || true
+            scripts/config --disable MALI_BIFROST || true
+            scripts/config --disable MALI_REAL_HW || true
+            scripts/config --disable MALI_BIFROST_DEVFREQ || true
+            scripts/config --disable MALI_BIFROST_GATOR_SUPPORT || true
+        else
+            echo "[*] Applying mali kernel config overrides..."
+            scripts/config --disable DRM_PANFROST || true
+            scripts/config --enable MALI_BIFROST || true
+            scripts/config --set-str MALI_PLATFORM_NAME "rk" || true
+            scripts/config --enable MALI_REAL_HW || true
+            scripts/config --enable MALI_BIFROST_DEVFREQ || true
+            scripts/config --enable MALI_BIFROST_GATOR_SUPPORT || true
+        fi
+
+        # Vendor Bifrost makefiles force -Werror; newer host toolchains can
+        # emit benign warnings that abort the whole build at drivers/gpu.
+        if [ "${RKDEBIAN_ALLOW_WARNINGS:-1}" = "1" ] && [ -f "drivers/gpu/arm/bifrost/Makefile" ]; then
+            if grep -q "CFLAGS_MODULE += -Wall -Werror" drivers/gpu/arm/bifrost/Makefile; then
+                sed -i 's/CFLAGS_MODULE += -Wall -Werror/CFLAGS_MODULE += -Wall/' drivers/gpu/arm/bifrost/Makefile
+                echo "[*] Relaxed Mali Bifrost warning policy (-Werror removed) for host-toolchain compatibility."
+            fi
+        fi
+
         scripts/config --set-str EXTRA_FIRMWARE "RAM_RW_KERNEL_DRAM.bin ROM_EXEC_KERNEL_IRAM.bin EA6621Q_SEEKWAVE_R00005.bin" || true
         scripts/config --set-str EXTRA_FIRMWARE_DIR "firmware" || true
 
@@ -377,8 +652,6 @@ create_update_package() {
     "${updater}" "${OUTPUT_DIR}/update/update.tar.gz"
 }
 
-CMD="${1:-all}"
-
 case "${CMD}" in
     check)
         check_deps
@@ -412,8 +685,10 @@ case "${CMD}" in
         ;;
     rootfs)
         run_build_rootfs
+        verify_rootfs_profile
         ;;
     image)
+        verify_rootfs_profile
         create_image
         ;;
     all)
@@ -422,11 +697,12 @@ case "${CMD}" in
         build_uboot
         build_kernel
         run_build_rootfs
+        verify_rootfs_profile
         create_image
         create_update_package
         ;;
     *)
-        echo "Usage: $0 {check|lunch|uboot|extboot|updateimg|updatepkg|compile|rootfs|image|all}"
+        usage
         exit 1
         ;;
 esac

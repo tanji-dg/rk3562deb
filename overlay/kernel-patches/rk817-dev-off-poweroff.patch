@@ -1,5 +1,5 @@
 diff --git a/drivers/mfd/rk808.c b/drivers/mfd/rk808.c
-index d89f97913..602447213 100644
+index d89f97913..b58d838b4 100644
 --- a/drivers/mfd/rk808.c
 +++ b/drivers/mfd/rk808.c
 @@ -926,8 +926,14 @@ static int rk805_device_shutdown_prepare(struct sys_off_data *data)
@@ -18,7 +18,7 @@ index d89f97913..602447213 100644
  
  	/* close rtc int when power off */
  	regmap_update_bits(rk808->regmap,
-@@ -937,37 +943,32 @@ static int rk817_shutdown_prepare(struct sys_off_data *data)
+@@ -937,37 +943,44 @@ static int rk817_shutdown_prepare(struct sys_off_data *data)
  			   RK817_RTC_INT_REG,
  			   (0x3 << 2), (0x0 << 2));
  
@@ -29,7 +29,14 @@ index d89f97913..602447213 100644
 -					 SLPPIN_NULL_FUN);
 -		if (ret)
 -			pr_err("shutdown: config SLPPIN_NULL_FUN error!\n");
--
++	/*
++	 * Set BAT_CON so the gauge re-initialises from OCV on next boot.
++	 * Full DEV_OFF drops the cached SOC registers.
++	 */
++	raw = i2c_smbus_read_byte_data(client, 0x57);
++	if (raw >= 0)
++		i2c_smbus_write_byte_data(client, 0x57, (u8)(raw | BIT(4)));
+ 
 -		ret = regmap_update_bits(rk808->regmap,
 -					 RK817_SYS_CFG(3),
 -					 RK817_SLPPOL_MSK,
@@ -70,11 +77,42 @@ index d89f97913..602447213 100644
 -	if (ret)
 -		dev_err(&rk808_i2c_client->dev, "Failed to shutdown device!\n");
 -	/* pmic need the SCL clock to synchronize register */
+-	mdelay(2);
+-	return ret;
 +	dev_info(&client->dev,
 +		 "shutdown: SYS_CFG3=0x%02x, wrote DEV_OFF\n", raw);
- 	mdelay(2);
--	return ret;
++	/*
++	 * Give the PMIC time to collapse rails before syscore shutdown runs;
++	 * otherwise a later SLPPIN_DN_FUN write can turn poweroff into reboot.
++	 */
++	mdelay(3000);
 +	return 0;
  }
  
  static void rk8xx_device_shutdown(void)
+@@ -1011,7 +1024,6 @@ static void (*pm_reboot)(void);
+ 
+ static void rk8xx_syscore_shutdown(void)
+ {
+-	int ret;
+ 	struct rk808 *rk808 = i2c_get_clientdata(rk808_i2c_client);
+ 
+ 	if (!rk808) {
+@@ -1039,17 +1051,6 @@ static void rk8xx_syscore_shutdown(void)
+ 	 * there are too many devices are competiting.
+ 	 */
+ 	if (system_state == SYSTEM_POWER_OFF) {
+-		if (rk808->variant == RK809_ID || rk808->variant == RK817_ID) {
+-			ret = regmap_update_bits(rk808->regmap,
+-						 RK817_SYS_CFG(3),
+-						 RK817_SLPPIN_FUNC_MSK,
+-						 SLPPIN_DN_FUN);
+-			if (ret) {
+-				dev_warn(&rk808_i2c_client->dev,
+-					 "Cannot switch to power down function\n");
+-			}
+-		}
+-
+ 		if (pm_shutdown) {
+ 			dev_info(&rk808_i2c_client->dev, "System power off\n");
+ 			pm_shutdown();
