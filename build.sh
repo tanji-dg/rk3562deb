@@ -260,6 +260,7 @@ setup_dirs() {
     mkdir -p "${OUT_DIR}/boot"
     mkdir -p "${OUT_DIR}/rootfs"
     mkdir -p "${OUTPUT_DIR}/update"
+    cleanup_stale_rootfs_mounts
 
     if [ "${EUID}" -ne 0 ]; then
         local repair_outputs=0
@@ -268,20 +269,49 @@ setup_dirs() {
         if [ ! -w "${OUT_DIR}" ] || [ ! -w "${OUT_DIR}/boot" ] || [ ! -w "${OUTPUT_DIR}" ]; then
             repair_outputs=1
         else
-            foreign_output=$(find "${OUT_DIR}" "${OUTPUT_DIR}" -mindepth 1 \
+            foreign_output=$(find "${OUT_DIR}" "${OUTPUT_DIR}" -xdev -mindepth 1 \
                 \( ! -uid "$(id -u)" -o ! -gid "$(id -g)" \) -print -quit 2>/dev/null || true)
             [ -n "${foreign_output}" ] && repair_outputs=1
         fi
 
         if [ "${repair_outputs}" -eq 1 ]; then
             echo "[*] Fixing ownership of output directories..."
-            if ! sudo chown -R "$(id -u):$(id -g)" "${OUT_DIR}" "${OUTPUT_DIR}"; then
+            if ! sudo find "${OUT_DIR}" "${OUTPUT_DIR}" -xdev -exec chown "$(id -u):$(id -g)" {} +; then
                 echo "[-] Error: output directories are not writable and ownership fix failed."
                 echo "    Please run: sudo chown -R $(id -u):$(id -g) ${OUT_DIR} ${OUTPUT_DIR}"
                 exit 1
             fi
         fi
     fi
+}
+
+cleanup_stale_rootfs_mounts() {
+    local mount_path
+    local cleaned=0
+
+    while IFS= read -r mount_path; do
+        [ -n "${mount_path}" ] || continue
+
+        if [ "${cleaned}" -eq 0 ]; then
+            echo "[*] Releasing stale rootfs bind mounts..."
+            cleaned=1
+        fi
+
+        if [ "${EUID}" -eq 0 ]; then
+            umount -l "${mount_path}" 2>/dev/null || true
+        else
+            sudo umount -l "${mount_path}" 2>/dev/null || true
+        fi
+    done < <(
+        findmnt -rn -o TARGET 2>/dev/null \
+            | awk -v root="${OUT_DIR}/rootfs" '
+                $0 == root || index($0, root "/") == 1 {
+                    print length($0) "\t" $0
+                }
+            ' \
+            | sort -rn \
+            | cut -f2-
+    )
 }
 
 sanitize_kbuild_cmd_files() {

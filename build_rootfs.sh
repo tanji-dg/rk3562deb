@@ -54,6 +54,33 @@ esac
 echo "[*] Building Debian 12 Bookworm arm64 rootfs..."
 echo "[*] UI session: ${RKDEBIAN_UI_SESSION} | GPU stack: ${RKDEBIAN_GPU_STACK}"
 
+chroot_cleanup() {
+    local mount_path
+    local cleaned=0
+
+    while IFS= read -r mount_path; do
+        [ -n "${mount_path}" ] || continue
+
+        if [ "${cleaned}" -eq 0 ]; then
+            echo "[*] Releasing stale chroot bind mounts..."
+            cleaned=1
+        fi
+
+        umount -l "${mount_path}" 2>/dev/null || true
+    done < <(
+        findmnt -rn -o TARGET 2>/dev/null \
+            | awk -v root="${ROOTFS_MNT}" '
+                $0 == root || index($0, root "/") == 1 {
+                    print length($0) "\t" $0
+                }
+            ' \
+            | sort -rn \
+            | cut -f2-
+    )
+}
+
+chroot_cleanup
+
 # Optional: force a fresh debootstrap rootfs to avoid stale package/config
 # carry-over across iterative builds.
 if [ "${RKDEBIAN_FORCE_CLEAN_ROOTFS:-0}" = "1" ]; then
@@ -83,6 +110,7 @@ fi
 
 # 2. Setup chroot mounts
 echo "[*] Setting up chroot mounts..."
+mkdir -p "${ROOTFS_MNT}/proc" "${ROOTFS_MNT}/sys" "${ROOTFS_MNT}/dev/pts"
 mount --bind /proc    "${ROOTFS_MNT}/proc"
 mount --bind /sys     "${ROOTFS_MNT}/sys"
 mount --bind /dev     "${ROOTFS_MNT}/dev"
@@ -90,12 +118,6 @@ mount --bind /dev/pts "${ROOTFS_MNT}/dev/pts"
 rm -f "${ROOTFS_MNT}/etc/resolv.conf"
 cp /etc/resolv.conf "${ROOTFS_MNT}/etc/resolv.conf"
 
-chroot_cleanup() {
-    umount -lf "${ROOTFS_MNT}/dev/pts" 2>/dev/null || true
-    umount -lf "${ROOTFS_MNT}/dev"     2>/dev/null || true
-    umount -lf "${ROOTFS_MNT}/sys"     2>/dev/null || true
-    umount -lf "${ROOTFS_MNT}/proc"    2>/dev/null || true
-}
 trap chroot_cleanup EXIT
 
 # 3. Configure Debian base
