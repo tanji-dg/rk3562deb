@@ -276,7 +276,7 @@ setup_dirs() {
 
         if [ "${repair_outputs}" -eq 1 ]; then
             echo "[*] Fixing ownership of output directories..."
-            if ! sudo find "${OUT_DIR}" "${OUTPUT_DIR}" -xdev -exec chown "$(id -u):$(id -g)" {} +; then
+            if ! sudo find "${OUT_DIR}" "${OUTPUT_DIR}" -xdev -exec chown -h "$(id -u):$(id -g)" {} +; then
                 echo "[-] Error: output directories are not writable and ownership fix failed."
                 echo "    Please run: sudo chown -R $(id -u):$(id -g) ${OUT_DIR} ${OUTPUT_DIR}"
                 exit 1

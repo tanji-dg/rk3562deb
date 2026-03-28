@@ -120,6 +120,12 @@ cp /etc/resolv.conf "${ROOTFS_MNT}/etc/resolv.conf"
 
 trap chroot_cleanup EXIT
 
+# Crashed package installs can leave broken apt temp symlinks behind, which
+# later confuse ownership repair in the outer build wrapper.
+echo "[*] Cleaning stale apt/dpkg temp state..."
+rm -rf "${ROOTFS_MNT}/tmp/apt-dpkg-install-"* 2>/dev/null || true
+rm -rf "${ROOTFS_MNT}/var/tmp/apt-dpkg-install-"* 2>/dev/null || true
+
 # 3. Configure Debian base
 echo "[*] Configuring Debian base inside chroot..."
 
