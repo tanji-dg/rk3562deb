@@ -193,6 +193,10 @@ if [ "${RKDEBIAN_UI_SESSION:-plasma}" = "lomiri" ]; then
     # Install Mir platform backends recommended by lomiri on Debian.
     apt-get install -y mir-platform-graphics-gbm-kms mir-platform-graphics-wayland \
         mir-platform-graphics-x mir-graphics-drivers-desktop || true
+    # Lomiri requires LightDM (SDDM cannot launch Wayland/Mir sessions reliably).
+    apt-get install -y lightdm lightdm-gtk-greeter
+    # Remove morph-browser — crashes on Mali due to libQt5SystemInfo X11 calls.
+    apt-get remove -y morph-browser 2>/dev/null || true
 fi
 
 # Optional Plasma/Mobile helpers.
@@ -279,10 +283,14 @@ echo "root:root" | chpasswd
 systemctl enable NetworkManager
 systemctl enable bluetooth
 systemctl enable upower || true
-# Reused rootfs trees may still point display-manager.service to LightDM.
-# Drop the stale link so enabling SDDM can recreate it.
+# Select display manager: LightDM for Lomiri, SDDM for Plasma.
 rm -f /etc/systemd/system/display-manager.service
-systemctl enable sddm
+if [ "${RKDEBIAN_UI_SESSION}" = "lomiri" ]; then
+    systemctl disable sddm 2>/dev/null || true
+    systemctl enable lightdm
+else
+    systemctl enable sddm
+fi
 systemctl enable packagekit || true
 
 # Enable compressed RAM swap to improve responsiveness on 4GB systems.
@@ -340,7 +348,7 @@ if [ ! -f "${ROOTFS_MNT}/tmp/setup_debian.sh" ]; then
     exit 1
 fi
 # Run through /bin/bash explicitly to avoid direct-exec/shebang edge cases.
-chroot "${ROOTFS_MNT}" env RKDEBIAN_UI_SESSION="${RKDEBIAN_UI_SESSION}" /bin/bash /tmp/setup_debian.sh
+chroot "${ROOTFS_MNT}" env RKDEBIAN_UI_SESSION="${RKDEBIAN_UI_SESSION}" QEMU_RESERVED_VA=0x4000000000 /bin/bash /tmp/setup_debian.sh
 rm "${ROOTFS_MNT}/tmp/setup_debian.sh"
 
 # Do not silently continue with Plasma when a Lomiri image was requested.
@@ -401,9 +409,23 @@ if [ "${RKDEBIAN_GPU_STACK:-mali}" = "panfrost" ]; then
         apt-get -f install -y
     fi
 else
-    # Select Mali package priority for current known-good Plasma X11 colors path:
-    # g13 x11-gbm -> generic x11-gbm -> x11-wayland-gbm -> wayland-gbm -> any.
+    # Select Mali package priority based on UI session.
+    # Lomiri runs on Mir/Wayland, so prefer wayland-gbm blobs.
+    # Plasma (X11) prefers x11-gbm for correct color rendering.
     selected_mali_deb=""
+    if [ "${RKDEBIAN_UI_SESSION}" = "lomiri" ]; then
+      # Lomiri: wayland-gbm -> x11-wayland-gbm -> any.
+      for candidate in \
+          /tmp/debs/libmali*-wayland-gbm*.deb \
+          /tmp/debs/libmali*-x11-wayland-gbm*.deb \
+          /tmp/debs/libmali*.deb; do
+        [ -e "${candidate}" ] || continue
+        selected_mali_deb="${candidate}"
+        break
+      done
+    fi
+    if [ -z "${selected_mali_deb}" ]; then
+    # Plasma / fallback: g13 x11-gbm -> generic x11-gbm -> x11-wayland-gbm -> wayland-gbm -> any.
     for candidate in \
         /tmp/debs/libmali*-g13p0*x11-gbm*.deb \
         /tmp/debs/libmali*-x11-gbm*.deb \
@@ -414,6 +436,7 @@ else
         selected_mali_deb="${candidate}"
         break
     done
+    fi
 
     if [ -n "${selected_mali_deb}" ]; then
         selected_mali_pkg="$(dpkg-deb -f "${selected_mali_deb}" Package)"
@@ -946,10 +969,12 @@ cat > "${ROOTFS_MNT}/etc/fstab" << 'FSTAB'
 PARTUUID=c0ffee11-2233-4455-6677-8899aabbccdd  /  ext4  defaults,noatime  0  1
 FSTAB
 
-# 9. Configure SDDM autologin
-echo "[*] Configuring SDDM autologin (${RKDEBIAN_UI_SESSION})..."
+# 9. Configure display manager autologin
+echo "[*] Configuring display manager autologin (${RKDEBIAN_UI_SESSION})..."
 mkdir -p "${ROOTFS_MNT}/etc/sddm.conf.d"
-rm -rf "${ROOTFS_MNT}/etc/lightdm"
+if [ "${RKDEBIAN_UI_SESSION}" != "lomiri" ]; then
+    rm -rf "${ROOTFS_MNT}/etc/lightdm"
+fi
 # Reused rootfs trees can retain a text-mode default target from prior
 # experiments or recovery boots. Force graphical boot so SDDM is started.
 ln -sf /lib/systemd/system/graphical.target "${ROOTFS_MNT}/etc/systemd/system/default.target"
@@ -1032,6 +1057,26 @@ else
     SDDM_DISPLAY_SERVER="x11"
 fi
 
+if [ "${RKDEBIAN_UI_SESSION}" = "lomiri" ]; then
+    # Lomiri uses LightDM with autologin into the Wayland/Mir session.
+    mkdir -p "${ROOTFS_MNT}/etc/lightdm"
+    # Remove KDE default session that conflicts with Lomiri.
+    rm -f "${ROOTFS_MNT}/usr/share/lightdm/lightdm.conf.d/40-kde-plasma-kf5.conf"
+    cat > "${ROOTFS_MNT}/etc/lightdm/lightdm.conf" << 'LIGHTDM_CONF'
+[LightDM]
+
+[Seat:*]
+type=local
+user-session=lomiri
+autologin-user=chaos
+autologin-session=lomiri
+session-wrapper=/etc/X11/Xsession
+
+[XDMCPServer]
+
+[VNCServer]
+LIGHTDM_CONF
+else
 cat > "${ROOTFS_MNT}/etc/sddm.conf.d/10-rk-autologin.conf" << SDDM_AUTLOGIN
 [Autologin]
 User=chaos
@@ -1042,16 +1087,17 @@ Relogin=false
 DisplayServer=${SDDM_DISPLAY_SERVER}
 SDDM_AUTLOGIN
 
-# Stale user-unit symlinks from old sway-focused rootfs trees can trigger
-# waybar restart loops in Plasma sessions (and tank UI responsiveness).
-rm -f "${ROOTFS_MNT}/etc/systemd/user/graphical-session.target.wants/waybar.service"
-
 # Configure an on-screen keyboard at the greeter for touch-only login.
 cat > "${ROOTFS_MNT}/etc/sddm.conf.d/20-rk-virtual-keyboard.conf" << 'SDDM_VK'
 [General]
 InputMethod=qtvirtualkeyboard
 GreeterEnvironment=QT_IM_MODULE=qtvirtualkeyboard
 SDDM_VK
+fi
+
+# Stale user-unit symlinks from old sway-focused rootfs trees can trigger
+# waybar restart loops in Plasma sessions (and tank UI responsiveness).
+rm -f "${ROOTFS_MNT}/etc/systemd/user/graphical-session.target.wants/waybar.service"
 
 # Export the Maliit input method globally so Lomiri and Plasma both pick up
 # the same Qt/GTK keyboard plugin wiring.
@@ -1099,6 +1145,38 @@ mkdir -p "${ROOTFS_MNT}/etc/systemd/user/graphical-session.target.wants" \
          "${ROOTFS_MNT}/etc/dconf/profile" \
          "${ROOTFS_MNT}/etc/dconf/db/local.d"
 
+# Mali blob workaround: glGetString(GL_RENDERER) returns NULL in surfaceless
+# EGL contexts, which causes Mir's gbm-kms rendering probe to fail.
+# This LD_PRELOAD shim returns "Mali-G52" when the real call returns NULL.
+if [ "${RKDEBIAN_GPU_STACK}" = "mali" ]; then
+    echo "[*] Building Mali glGetString workaround for Mir/Lomiri..."
+    cat > "${ROOTFS_MNT}/tmp/gl_renderer_fix.c" << 'GL_FIX_C'
+#include <dlfcn.h>
+typedef unsigned int GLenum;
+const unsigned char* glGetString(GLenum name) {
+    static const unsigned char* (*real_glGetString)(GLenum) = 0;
+    if (!real_glGetString)
+        real_glGetString = dlsym(((void*)-1l), "glGetString");
+    const unsigned char* result = real_glGetString(name);
+    if (name == 0x1F01 && result == 0)
+        return (const unsigned char*)"Mali-G52";
+    return result;
+}
+GL_FIX_C
+    chroot "${ROOTFS_MNT}" gcc -shared -fPIC -o /usr/local/lib/gl_renderer_fix.so \
+        /tmp/gl_renderer_fix.c -ldl
+    rm -f "${ROOTFS_MNT}/tmp/gl_renderer_fix.c"
+
+    # Inject LD_PRELOAD into lomiri-session so Mir picks up the fix.
+    if [ -f "${ROOTFS_MNT}/usr/bin/lomiri-session" ] && \
+       ! grep -q 'gl_renderer_fix' "${ROOTFS_MNT}/usr/bin/lomiri-session"; then
+        sed -i '2a export LD_PRELOAD=/usr/local/lib/gl_renderer_fix.so' \
+            "${ROOTFS_MNT}/usr/bin/lomiri-session"
+    fi
+
+fi
+
+
 cat > "${ROOTFS_MNT}/etc/systemd/user/rk-lomiri-maliit-server.service" << 'LOMIRI_MALIIT'
 [Unit]
 Description=RKDEBIAN Maliit input method for Lomiri
@@ -1117,72 +1195,33 @@ LOMIRI_MALIIT
 ln -sf /etc/systemd/user/rk-lomiri-maliit-server.service \
     "${ROOTFS_MNT}/etc/systemd/user/graphical-session.target.wants/rk-lomiri-maliit-server.service"
 
-LOMIRI_POLKIT_AGENT=""
-if [ -x "${ROOTFS_MNT}/usr/lib/policykit-1-gnome/polkit-gnome-authentication-agent-1" ]; then
-    LOMIRI_POLKIT_AGENT="/usr/lib/policykit-1-gnome/polkit-gnome-authentication-agent-1"
-elif [ -x "${ROOTFS_MNT}/usr/libexec/polkit-mate-authentication-agent-1" ]; then
-    LOMIRI_POLKIT_AGENT="/usr/libexec/polkit-mate-authentication-agent-1"
-fi
-
-if [ -n "${LOMIRI_POLKIT_AGENT}" ]; then
-cat > "${ROOTFS_MNT}/etc/systemd/user/rk-lomiri-polkit-agent.service" << LOMIRI_POLKIT
-[Unit]
-Description=RKDEBIAN PolicyKit agent for Lomiri
-PartOf=graphical-session.target
-After=dbus.socket lomiri.service
-Requires=dbus.socket
-
-[Service]
-Type=simple
-ExecStart=${LOMIRI_POLKIT_AGENT}
-Restart=on-failure
-
-[Install]
-WantedBy=graphical-session.target
-LOMIRI_POLKIT
-ln -sf /etc/systemd/user/rk-lomiri-polkit-agent.service \
-    "${ROOTFS_MNT}/etc/systemd/user/graphical-session.target.wants/rk-lomiri-polkit-agent.service"
-else
-    echo "[!] Warning: no graphical polkit agent found for Lomiri session."
-fi
+# Do not auto-start a graphical polkit agent in Lomiri — it shows as a
+# visible terminal window inside the shell.  PolicyKit prompts will still
+# work via the polkitd daemon; they just won't get a GUI popup.
+rm -f "${ROOTFS_MNT}/etc/systemd/user/rk-lomiri-polkit-agent.service" \
+      "${ROOTFS_MNT}/etc/systemd/user/graphical-session.target.wants/rk-lomiri-polkit-agent.service"
 
 cat > "${ROOTFS_MNT}/etc/lomiri/devices.conf" << 'LOMIRI_DEVICES'
-# Force this RK3562 tablet into a touch-first landscape shell until the
-# accelerometer/orientation path is fully validated in Lomiri.
+# RK3562 tablet: allow all orientations, start in portrait
+# (matching the native 800x1280 panel).
 [rk3562-debian]
-SupportedOrientations=Landscape,InvertedLandscape
-PrimaryOrientation=Landscape
-LandscapeOrientation=Landscape
-InvertedLandscapeOrientation=InvertedLandscape
-PortraitOrientation=Portrait
-InvertedPortraitOrientation=InvertedPortrait
+SupportedOrientations=Portrait,InvertedPortrait,Landscape,InvertedLandscape
+PrimaryOrientation=Portrait
 Category=tablet
 
 [rk3562-rk817-tablet]
-SupportedOrientations=Landscape,InvertedLandscape
-PrimaryOrientation=Landscape
-LandscapeOrientation=Landscape
-InvertedLandscapeOrientation=InvertedLandscape
-PortraitOrientation=Portrait
-InvertedPortraitOrientation=InvertedPortrait
+SupportedOrientations=Portrait,InvertedPortrait,Landscape,InvertedLandscape
+PrimaryOrientation=Portrait
 Category=tablet
 
 [rockchip,rk3562-rk817-tablet]
-SupportedOrientations=Landscape,InvertedLandscape
-PrimaryOrientation=Landscape
-LandscapeOrientation=Landscape
-InvertedLandscapeOrientation=InvertedLandscape
-PortraitOrientation=Portrait
-InvertedPortraitOrientation=InvertedPortrait
+SupportedOrientations=Portrait,InvertedPortrait,Landscape,InvertedLandscape
+PrimaryOrientation=Portrait
 Category=tablet
 
 [Rockchip RK3562 RK817 TABLET LP4 Board]
-SupportedOrientations=Landscape,InvertedLandscape
-PrimaryOrientation=Landscape
-LandscapeOrientation=Landscape
-InvertedLandscapeOrientation=InvertedLandscape
-PortraitOrientation=Portrait
-InvertedPortraitOrientation=InvertedPortrait
+SupportedOrientations=Portrait,InvertedPortrait,Landscape,InvertedLandscape
+PrimaryOrientation=Portrait
 Category=tablet
 LOMIRI_DEVICES
 
@@ -2226,6 +2265,62 @@ WantedBy=multi-user.target
 RK_BAT_GAUGE_FIX_UNIT
 chroot "${ROOTFS_MNT}" systemctl enable rk-battery-gauge-fix.service
 
+# 10e. RK817 hard power-off hook (avoid poweroff->reboot bounce).
+echo "[*] Installing RK817 DEV_OFF shutdown hook..."
+mkdir -p "${ROOTFS_MNT}/lib/systemd/system-shutdown"
+cat > "${ROOTFS_MNT}/lib/systemd/system-shutdown/rk817-devoff" << 'RK817_DEVOFF_HOOK'
+#!/bin/sh
+set -eu
+
+mode="${1:-}"
+case "${mode}" in
+    poweroff|halt) ;;
+    *) exit 0 ;;
+esac
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+I2C_BUS=0
+PMIC_ADDR=0x20
+SYS_CFG3_REG=0xf4
+GG_STS_REG=0x57
+
+log() {
+    echo "rk817-devoff: $*" > /dev/kmsg 2>/dev/null || true
+}
+
+if command -v i2cget >/dev/null 2>&1 && command -v i2cset >/dev/null 2>&1; then
+    # Match kernel patch behavior: set BAT_CON before DEV_OFF.
+    raw57="$(i2cget -y -f "${I2C_BUS}" "${PMIC_ADDR}" "${GG_STS_REG}" b 2>/dev/null || true)"
+    case "${raw57}" in
+        0x[0-9a-fA-F]|0x[0-9a-fA-F][0-9a-fA-F])
+            val57=$(( (raw57 | 0x10) & 0xff ))
+            i2cset -y -f "${I2C_BUS}" "${PMIC_ADDR}" "${GG_STS_REG}" "${val57}" b >/dev/null 2>&1 || true
+            log "GG_STS ${raw57} -> $(printf '0x%02x' "${val57}")"
+            ;;
+    esac
+
+    raw="$(i2cget -y -f "${I2C_BUS}" "${PMIC_ADDR}" "${SYS_CFG3_REG}" b 2>/dev/null || true)"
+    case "${raw}" in
+        0x[0-9a-fA-F]|0x[0-9a-fA-F][0-9a-fA-F])
+            val=$(( (raw | 0x01) & 0xff ))
+            if i2cset -y -f "${I2C_BUS}" "${PMIC_ADDR}" "${SYS_CFG3_REG}" "${val}" b >/dev/null 2>&1; then
+                log "SYS_CFG3 ${raw} -> $(printf '0x%02x' "${val}") DEV_OFF"
+            else
+                log "SYS_CFG3 write failed (raw=${raw})"
+            fi
+            ;;
+        *)
+            log "SYS_CFG3 read failed"
+            ;;
+    esac
+fi
+
+# Give PMIC time to collapse rails before final shutdown sequence continues.
+sleep 3
+exit 0
+RK817_DEVOFF_HOOK
+chmod +x "${ROOTFS_MNT}/lib/systemd/system-shutdown/rk817-devoff"
+
 # 10e. Session failsafe watchdog (auto-rollback for risky session tests).
 echo "[*] Installing session failsafe watchdog..."
 cat > "${ROOTFS_MNT}/usr/local/sbin/rk-session-failsafe.sh" << 'RK_SESSION_FAILSAFE'
@@ -2516,6 +2611,10 @@ if [ -d "${TMP_DIR}/boot" ]; then
         fi
         if [ -f "${TMP_DIR}/boot/rk3562.dtb" ]; then
             install -m 0644 "${TMP_DIR}/boot/rk3562.dtb" /boot/rk3562.dtb
+            REBOOT_NEEDED=1
+        fi
+        if [ -f "${TMP_DIR}/boot/rk3562-fallback.dtb" ]; then
+            install -m 0644 "${TMP_DIR}/boot/rk3562-fallback.dtb" /boot/rk3562-fallback.dtb
             REBOOT_NEEDED=1
         fi
         if [ -f "${TMP_DIR}/boot/extlinux/extlinux.conf" ]; then

@@ -15,7 +15,7 @@ if [ ! -d "${ROOTFS_DIR}" ]; then
     exit 1
 fi
 
-for required in "${BOOT_DIR}/Image" "${BOOT_DIR}/rk3562.dtb" "${BOOT_DIR}/extlinux/extlinux.conf"; do
+for required in "${BOOT_DIR}/Image" "${BOOT_DIR}/rk3562.dtb" "${BOOT_DIR}/rk3562-fallback.dtb" "${BOOT_DIR}/extlinux/extlinux.conf"; do
     if [ ! -f "${required}" ]; then
         echo "[-] Missing boot artifact: ${required}"
         exit 1
@@ -47,6 +47,7 @@ sudo tar \
 
 cp -f "${BOOT_DIR}/Image" "${STAGE_DIR}/boot/Image"
 cp -f "${BOOT_DIR}/rk3562.dtb" "${STAGE_DIR}/boot/rk3562.dtb"
+cp -f "${BOOT_DIR}/rk3562-fallback.dtb" "${STAGE_DIR}/boot/rk3562-fallback.dtb"
 cp -f "${BOOT_DIR}/extlinux/extlinux.conf" "${STAGE_DIR}/boot/extlinux/extlinux.conf"
 
 {

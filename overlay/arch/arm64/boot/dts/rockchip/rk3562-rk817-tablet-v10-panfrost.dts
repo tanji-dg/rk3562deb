@@ -284,12 +284,6 @@
 
 		width-mm = <135>;
 		height-mm = <216>;
-		/*
-		 * Keep early boot/KMS in landscape for this tablet panel orientation
-		 * (matching the camera-top side used by userspace).
-		 */
-		rotation = <90>;
-
 		bpc = <8>;
 		bus-format = <0x100a>; /* MEDIA_BUS_FMT_RGB888_1X24 — avoids vop3_output_rb_swap which incorrectly applies DSP_RB_SWAP on RK3562 (VOP2 not VOP3) */
 
@@ -353,6 +347,18 @@
 &gpu {
 	mali-supply = <&vdd_gpu>;
 	/*
+	 * Panfrost expects IRQ names "job", "mmu", "gpu".  On this board the
+	 * physical IRQ lines are wired as:
+	 *   GPU(reset/completion)=SPI75, MMU=SPI77, JOB=SPI76
+	 * so for Panfrost we must map:
+	 *   job->SPI76, mmu->SPI77, gpu->SPI75
+	 */
+	interrupts = <GIC_SPI 76 IRQ_TYPE_LEVEL_HIGH>,
+		     <GIC_SPI 77 IRQ_TYPE_LEVEL_HIGH>,
+		     <GIC_SPI 75 IRQ_TYPE_LEVEL_HIGH>;
+	/* Panfrost looks up IRQs by lowercase names ("job", "mmu", "gpu"). */
+	interrupt-names = "job", "mmu", "gpu";
+	/*
 	 * The stock rk3562.dtsi GPU OPP table relies on nvmem-backed supported-hw
 	 * selection. On this tablet that resolves to zero valid OPPs, so Panfrost
 	 * aborts probe with "no supported OPPs". Use a simple board-local table
@@ -368,23 +374,15 @@
 
 		opp-300000000 {
 			opp-hz = /bits/ 64 <300000000>;
-			opp-microvolt = <825000 825000 1000000>;
+			opp-microvolt = <825000>;
 		};
 		opp-400000000 {
 			opp-hz = /bits/ 64 <400000000>;
-			opp-microvolt = <825000 825000 1000000>;
+			opp-microvolt = <825000>;
 		};
 		opp-500000000 {
 			opp-hz = /bits/ 64 <500000000>;
-			opp-microvolt = <825000 825000 1000000>;
-		};
-		opp-600000000 {
-			opp-hz = /bits/ 64 <600000000>;
-			opp-microvolt = <825000 825000 1000000>;
-		};
-		opp-700000000 {
-			opp-hz = /bits/ 64 <700000000>;
-			opp-microvolt = <900000 900000 1000000>;
+			opp-microvolt = <825000>;
 		};
 	};
 };

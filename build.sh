@@ -22,6 +22,7 @@ RKBIN_BRANCH="master"
 UBOOT_DEFCONFIG="rk3562_defconfig"
 KERNEL_DEFCONFIG="rockchip_linux_defconfig"
 KERNEL_DTB="rk3562-rk817-tablet-v10.dtb"
+KERNEL_DTB_PANFROST="rk3562-rk817-tablet-v10-panfrost.dtb"
 RKDEBIAN_DISPLAY_SERVER="${RKDEBIAN_DISPLAY_SERVER:-x11}"
 RKDEBIAN_UI_SESSION="${RKDEBIAN_UI_SESSION:-plasma}"
 RKDEBIAN_GPU_STACK="${RKDEBIAN_GPU_STACK:-mali}"
@@ -411,12 +412,14 @@ build_kernel() {
 
         if [ "${RKDEBIAN_GPU_STACK}" = "panfrost" ]; then
             local panfrost_dts="arch/arm64/boot/dts/rockchip/rk3562-rk817-tablet-v10-panfrost.dts"
-            local active_dts="arch/arm64/boot/dts/rockchip/rk3562-rk817-tablet-v10.dts"
-            if [ -f "${panfrost_dts}" ]; then
-                cp -f "${panfrost_dts}" "${active_dts}"
-                echo "[*] GPU stack=panfrost: using panfrost-friendly tablet DTS overrides."
+            local rockchip_dts_makefile="arch/arm64/boot/dts/rockchip/Makefile"
+            if [ -f "${panfrost_dts}" ] && [ -f "${rockchip_dts_makefile}" ]; then
+                if ! grep -q "rk3562-rk817-tablet-v10-panfrost.dtb" "${rockchip_dts_makefile}"; then
+                    echo 'dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3562-rk817-tablet-v10-panfrost.dtb' >> "${rockchip_dts_makefile}"
+                    echo "[*] Added panfrost DTB target to Rockchip Makefile."
+                fi
             else
-                echo "[!] Warning: ${panfrost_dts} not found; keeping default tablet DTS."
+                echo "[!] Warning: panfrost DTS or rockchip Makefile missing; panfrost DTB target may be unavailable."
             fi
         fi
 
@@ -544,9 +547,20 @@ build_kernel() {
 
     RKDEBIAN_ALLOW_WARNINGS=1 make ARCH=arm64 CROSS_COMPILE=${CROSS_COMPILE} WERROR=0 -j${MAKE_THREADS} Image dtbs modules
 
-    # Find the compiled DTB
+    # Find the compiled DTBs (primary + fallback)
+    local primary_dtb_name="${KERNEL_DTB}"
+    local fallback_dtb_name="${KERNEL_DTB_PANFROST}"
+    if [ "${RKDEBIAN_GPU_STACK}" = "panfrost" ]; then
+        primary_dtb_name="${KERNEL_DTB_PANFROST}"
+        fallback_dtb_name="${KERNEL_DTB}"
+    fi
+
     local dtb_path=""
-    dtb_path=$(find arch/arm64/boot/dts/rockchip/ -name "${KERNEL_DTB}" | head -n1 || true)
+    local fallback_dtb_path=""
+    dtb_path=$(find arch/arm64/boot/dts/rockchip/ -name "${primary_dtb_name}" | head -n1 || true)
+    if [ -z "${dtb_path}" ]; then
+        dtb_path=$(find arch/arm64/boot/dts/rockchip/ -name "${KERNEL_DTB}" | head -n1 || true)
+    fi
     if [ -z "${dtb_path}" ]; then
         dtb_path=$(find arch/arm64/boot/dts/rockchip/ -name "rk3562-*.dtb" | grep -E 'linux|firefly|aio|evb' | head -n1 || true)
     fi
@@ -559,10 +573,18 @@ build_kernel() {
         exit 1
     fi
 
+    fallback_dtb_path=$(find arch/arm64/boot/dts/rockchip/ -name "${fallback_dtb_name}" | head -n1 || true)
+    if [ -z "${fallback_dtb_path}" ]; then
+        echo "[!] Warning: fallback DTB (${fallback_dtb_name}) not found; reusing primary DTB as fallback."
+        fallback_dtb_path="${dtb_path}"
+    fi
+
     cp "${dtb_path}" "${OUT_DIR}/boot/rk3562.dtb"
+    cp "${fallback_dtb_path}" "${OUT_DIR}/boot/rk3562-fallback.dtb"
     cp arch/arm64/boot/Image "${OUT_DIR}/boot/Image"
     
-    echo "[+] Using DTB: $(basename "${dtb_path}")"
+    echo "[+] Using primary DTB: $(basename "${dtb_path}")"
+    echo "[+] Using fallback DTB: $(basename "${fallback_dtb_path}")"
 
     # Install modules for Debian rootfs
     echo "[*] Installing kernel modules..."
@@ -584,7 +606,7 @@ create_image() {
     mkdir -p "${OUT_DIR}/boot/extlinux"
     cp "${ROOT_DIR}/extlinux.conf" "${OUT_DIR}/boot/extlinux/extlinux.conf"
 
-    for required in "${OUT_DIR}/idbloader.img" "${OUT_DIR}/u-boot.itb" "${OUT_DIR}/boot/Image" "${OUT_DIR}/boot/rk3562.dtb"; do
+    for required in "${OUT_DIR}/idbloader.img" "${OUT_DIR}/u-boot.itb" "${OUT_DIR}/boot/Image" "${OUT_DIR}/boot/rk3562.dtb" "${OUT_DIR}/boot/rk3562-fallback.dtb"; do
         if [ ! -f "${required}" ]; then
             echo "[-] Error: Missing build artifact: ${required}"
             exit 1
