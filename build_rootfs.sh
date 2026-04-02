@@ -150,12 +150,18 @@ deb http://deb.debian.org/debian bookworm-updates main contrib non-free non-free
 deb http://security.debian.org/debian-security bookworm-security main contrib non-free non-free-firmware
 APT_SOURCES
 
+# Avoid man-db trigger permission issues on reused/rootless-compatible trees.
+mkdir -p /var/cache/man
+chown -R root:root /var/cache/man 2>/dev/null || true
+chmod -R u+rwX /var/cache/man 2>/dev/null || true
+
 # Update apt and install basic utilities
 apt-get update
 apt-get install -y sudo curl wget nano vim openssh-server network-manager wpasupplicant iw wireless-tools \
     network-manager-gnome bluez blueman policykit-1-gnome \
     xorg xserver-xorg xserver-xorg-input-libinput firefox-esr mesa-utils libgl1-mesa-dri mesa-vulkan-drivers \
     pipewire pipewire-audio pipewire-alsa pipewire-pulse wireplumber pavucontrol alsa-utils libasound2-plugins \
+    gedit \
     zram-tools \
     plymouth plymouth-themes \
     libegl1 libgles2 libgbm1 libva2 libva-drm2 ffmpeg dbus \
@@ -218,6 +224,32 @@ for optional_pkg in xdg-desktop-portal-gtk xdg-desktop-portal-gnome plasma-disco
         echo "[!] Warning: ${optional_pkg} not available, skipping"
     fi
 done
+
+# Camera bring-up helpers for quick on-device verification.
+for camera_pkg in v4l-utils libcamera-tools; do
+    pkg_ver=$(apt-cache policy "${camera_pkg}" 2>/dev/null | awk '/Candidate:/{print $2}')
+    if [ -n "${pkg_ver}" ] && [ "${pkg_ver}" != "(none)" ]; then
+        apt-get install -y "${camera_pkg}" || \
+            echo "[!] Warning: ${camera_pkg} install failed, skipping"
+    else
+        echo "[!] Warning: ${camera_pkg} not available, skipping"
+    fi
+done
+
+# Install at least one GUI camera app when available.
+camera_app_installed=0
+for camera_app_pkg in snapshot cheese; do
+    pkg_ver=$(apt-cache policy "${camera_app_pkg}" 2>/dev/null | awk '/Candidate:/{print $2}')
+    if [ -n "${pkg_ver}" ] && [ "${pkg_ver}" != "(none)" ]; then
+        if apt-get install -y "${camera_app_pkg}"; then
+            camera_app_installed=1
+            break
+        fi
+    fi
+done
+if [ "${camera_app_installed}" -eq 0 ]; then
+    echo "[!] Warning: no GUI camera app package available (snapshot/cheese)."
+fi
 
 # App store source: Flathub remote for Flatpak.
 if command -v flatpak >/dev/null 2>&1; then
@@ -674,6 +706,10 @@ set -e
 cd /tmp
 
 # Install build dependencies for VAAPI driver
+mkdir -p /var/cache/man
+chown -R root:root /var/cache/man 2>/dev/null || true
+chmod -R u+rwX /var/cache/man 2>/dev/null || true
+
 apt-get install -y --no-install-recommends git build-essential libva-dev libdrm-dev pkg-config
 
 # Install librga prebuilt + headers from airockchip/librga
@@ -728,7 +764,11 @@ apt-get autoremove -y 2>/dev/null || true
 echo "[+] Rockchip VAAPI driver ready."
 BUILD_VAAPI_EOF
 chmod +x "${ROOTFS_MNT}/tmp/build_vaapi.sh"
-chroot "${ROOTFS_MNT}" /tmp/build_vaapi.sh || echo "[!] Warning: VAAPI driver build failed; hardware video decode will not be available."
+if chroot "${ROOTFS_MNT}" /tmp/build_vaapi.sh; then
+    echo "[*] VAAPI helper finished."
+else
+    echo "[!] Warning: VAAPI driver build failed; hardware video decode may be unavailable."
+fi
 rm -f "${ROOTFS_MNT}/tmp/build_vaapi.sh"
 
 echo "[*] Adding Firefox acceleration defaults..."
@@ -1539,6 +1579,9 @@ yelp.desktop
 org.gnome.Help.desktop
 org.gnome.Extensions.desktop
 org.gnome.Shell.Extensions.desktop
+kdesystemsettings.desktop
+systemsettings.desktop
+org.kde.systemsettings.desktop
 debian-xterm.desktop
 debian-uxterm.desktop
 xterm.desktop
