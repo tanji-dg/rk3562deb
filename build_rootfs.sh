@@ -168,7 +168,8 @@ apt-get install -y sudo curl wget nano vim openssh-server network-manager wpasup
     vainfo vdpauinfo \
     wireless-regdb firmware-brcm80211 \
     gnome-themes-extra gnome-themes-extra-data adwaita-icon-theme \
-    packagekit flatpak appstream xdg-desktop-portal
+    packagekit flatpak appstream xdg-desktop-portal \
+    dolphin plasma-discover
 
 # Remove any Trixie apt source that may be left over from a previous failed
 # build attempt.  Trixie packages require libc6 >= 2.38 which Bookworm does
@@ -181,7 +182,8 @@ apt-get update -qq
 # still converges to the Phosh profile.
 stale_session_pkgs="$(
     dpkg-query -W -f='${Package}\n' | \
-        grep -E '^(lomiri(|-.*)|mir-platform-graphics-.*|mir-graphics-drivers-desktop|plasma-.*|kwin-wayland|sddm(|-.*)|kde-plasma-desktop)$' || true
+        grep -E '^(lomiri(|-.*)|mir-platform-graphics-.*|mir-graphics-drivers-desktop|plasma-.*|kwin-wayland|sddm(|-.*)|kde-plasma-desktop)$' | \
+        grep -Ev '^plasma-discover(|-.*)$' || true
 )"
 if [ -n "${stale_session_pkgs}" ]; then
     echo "[*] Purging stale desktop/session packages: ${stale_session_pkgs//$'\n'/ }"
@@ -194,8 +196,17 @@ apt-get install -y lightdm lightdm-gtk-greeter \
     phosh phoc phosh-mobile-settings phosh-mobile-tweaks phosh-plugins \
     squeekboard wlr-randr grim xwayland iio-sensor-proxy
 
+# Prefer a modern terminal app over legacy xterm/uxterm launchers.
+if apt-cache show kgx >/dev/null 2>&1; then
+    apt-get install -y kgx
+elif apt-cache show gnome-terminal >/dev/null 2>&1; then
+    apt-get install -y gnome-terminal
+else
+    echo "[!] Warning: no modern terminal package found (kgx/gnome-terminal)."
+fi
+
 # Optional helpers for sandboxed apps and touch/desktop integration.
-for optional_pkg in xdg-desktop-portal-gtk xdg-desktop-portal-gnome; do
+for optional_pkg in xdg-desktop-portal-gtk xdg-desktop-portal-gnome plasma-discover-backend-flatpak; do
     # Check exact Bookworm version to avoid accidentally pulling Trixie builds
     # that sneak in via a dirty apt cache.
     pkg_ver=$(apt-cache policy "${optional_pkg}" 2>/dev/null \
@@ -272,6 +283,10 @@ enable_if_installable() {
 systemctl enable NetworkManager
 enable_if_installable bluetooth.service
 enable_if_installable upower.service
+# This tablet has no cellular modem; keep WWAN stack disabled so Phosh does
+# not show a cellular status path on the top bar.
+systemctl disable ModemManager.service 2>/dev/null || true
+systemctl mask ModemManager.service 2>/dev/null || true
 # Select display manager: LightDM for Phosh.
 rm -f /etc/systemd/system/display-manager.service
 systemctl disable sddm 2>/dev/null || true
@@ -305,6 +320,14 @@ cat > /etc/network/interfaces << 'IFACES'
 auto lo
 iface lo inet loopback
 IFACES
+
+# Default Phosh WWAN backend away from ModemManager on non-cellular hardware.
+mkdir -p /etc/dconf/db/local.d
+cat > /etc/dconf/db/local.d/20-rkdebian-phosh-wwan << 'PHOSH_WWAN_DCONF'
+[sm/puri/phosh]
+wwan-backend='ofono'
+PHOSH_WWAN_DCONF
+dconf update >/dev/null 2>&1 || true
 
 # Automatically power adapters when bluetoothd starts.
 if grep -q '^[#[:space:]]*AutoEnable=' /etc/bluetooth/main.conf 2>/dev/null; then
@@ -914,17 +937,27 @@ if [ "${FF_VAAPI_ENABLED}" = "true" ]; then
 # RK3562 hardware acceleration — sourced by /usr/bin/chromium wrapper
 # Let Chromium select its default GL backend for this build.
 # On Debian Chromium arm64, forcing --use-gl=egl can trigger GPU init fallback.
-# VAAPI hardware video decode via rockchip_drv_video.so + MPP.
+# rockchip VAAPI decode is available but has been unstable on YouTube with
+# newer Chromium builds; default to software decode for reliability.
 export LIBVA_DRIVER_NAME=rockchip
 export LIBVA_DRIVERS_PATH=/usr/lib/aarch64-linux-gnu/dri
 CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --ozone-platform=wayland"
-CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --ignore-gpu-blocklist"
+# Chromium 146 on RK3562 + Wayland can auto-pick Vulkan and fail window
+# startup; force non-Vulkan rendering for reliable launch.
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --disable-vulkan"
 CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --enable-gpu-rasterization"
 CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --enable-gpu-compositing"
-CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --disable-gpu-sandbox"
-CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --enable-accelerated-video-decode"
-CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --enable-features=VaapiVideoDecoder,VaapiVideoDecodeLinuxGL,VaapiIgnoreDriverChecks"
-CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --disable-features=UseChromeOSDirectVideoDecoder"
+# Avoid GNOME keyring first-launch password prompt on autologin images.
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --password-store=basic"
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --disable-accelerated-video-decode"
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --disable-features=VaapiVideoDecoder,VaapiVideoDecodeLinuxGL,VaapiIgnoreDriverChecks,UseChromeOSDirectVideoDecoder"
+# RK3562 fallback safety profile: software compositing is slower but avoids
+# GPU process crashes seen on some YouTube/Wayland workloads.
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --disable-gpu"
+# Optional (faster but less stable on some images): enable VAAPI decode
+# CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --enable-accelerated-video-decode"
+# CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --enable-features=VaapiVideoDecoder,VaapiVideoDecodeLinuxGL,VaapiIgnoreDriverChecks"
+# CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --disable-features=UseChromeOSDirectVideoDecoder"
 # ── FALLBACK: if Chromium regresses, force ANGLE explicitly: ──
 # CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --use-gl=angle"
 # CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --use-angle=opengles"
@@ -935,14 +968,56 @@ else
 # RK3562 — GPU compositing, software video decode
 # (VAAPI driver not found at build time)
 CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --ozone-platform=wayland"
-CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --ignore-gpu-blocklist"
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --disable-vulkan"
 CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --enable-gpu-rasterization"
 CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --enable-gpu-compositing"
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --password-store=basic"
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --disable-accelerated-video-decode"
+# RK3562 fallback safety profile: software compositing is slower but avoids
+# GPU process crashes seen on some YouTube/Wayland workloads.
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --disable-gpu"
 # ── FALLBACK: if Chromium regresses, force ANGLE explicitly: ──
 # CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --use-gl=angle"
 # CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --use-angle=opengles"
 CHROMIUM_SW_FLAGS
 fi
+
+# Hide WWAN UI elements on non-cellular tablets. Phosh 0.24 keeps WWAN
+# controls visible (or leaves empty slots) even when no modem exists.
+echo "[*] Configuring Phosh WWAN UI overrides..."
+mkdir -p "${ROOTFS_MNT}/etc/phosh/resource-overrides/sm/puri/phosh/ui"
+if command -v gresource >/dev/null 2>&1; then
+    if gresource extract "${ROOTFS_MNT}/usr/libexec/phosh" /sm/puri/phosh/ui/settings.ui \
+        > "${ROOTFS_MNT}/etc/phosh/resource-overrides/sm/puri/phosh/ui/settings.ui"; then
+        # Remove WWAN quick-setting block entirely so GtkFlowBox does not
+        # reserve a blank tile.
+        perl -0777 -i -pe 's#\n\s*<child>\n\s*<object class="PhoshQuickSetting" id="wwan_quick_setting">[\s\S]*?</child>\n\s*<child>\n\s*<object class="PhoshQuickSetting" id="wifi_quick_setting">#\n                <child>\n                  <object class="PhoshQuickSetting" id="wifi_quick_setting">#s' \
+            "${ROOTFS_MNT}/etc/phosh/resource-overrides/sm/puri/phosh/ui/settings.ui"
+    else
+        echo "[!] Warning: could not extract Phosh settings UI resource; WWAN quick tile override skipped."
+    fi
+
+    if gresource extract "${ROOTFS_MNT}/usr/libexec/phosh" /sm/puri/phosh/ui/top-panel.ui \
+        > "${ROOTFS_MNT}/etc/phosh/resource-overrides/sm/puri/phosh/ui/top-panel.ui"; then
+        # Remove WWAN indicator from top panel network box.
+        perl -0777 -i -pe 's#\n\s*<child>\n\s*<object class="PhoshWWanInfo" id="wwaninfo">[\s\S]*?</child>\n\s*<child>\n\s*<object class="PhoshWifiInfo" id="wifiinfo">#\n                    <child>\n                      <object class="PhoshWifiInfo" id="wifiinfo">#s' \
+            "${ROOTFS_MNT}/etc/phosh/resource-overrides/sm/puri/phosh/ui/top-panel.ui"
+    else
+        echo "[!] Warning: could not extract Phosh top-panel UI resource; WWAN top-bar override skipped."
+    fi
+else
+    echo "[!] Warning: gresource not available on host; WWAN UI overrides skipped."
+fi
+
+cat > "${ROOTFS_MNT}/etc/profile.d/90-phosh-resource-overrides.sh" << 'PHOSH_RESOURCE_OVERLAY'
+# Ensure Phosh can override selected built-in GResources from filesystem.
+_PHOSH_OVERLAY="/sm/puri/phosh=/etc/phosh/resource-overrides/sm/puri/phosh"
+case ":${G_RESOURCE_OVERLAYS:-}:" in
+  *":${_PHOSH_OVERLAY}:"*) ;;
+  *) export G_RESOURCE_OVERLAYS="${_PHOSH_OVERLAY}${G_RESOURCE_OVERLAYS:+:${G_RESOURCE_OVERLAYS}}" ;;
+esac
+unset _PHOSH_OVERLAY
+PHOSH_RESOURCE_OVERLAY
 
 # 8. Setting hostname and fstab
 echo "[*] Setting hostname and fstab..."
@@ -1220,6 +1295,198 @@ chroot "${ROOTFS_MNT}" chown chaos:chaos \
     /home/chaos/.local/bin/phosh-autorotate.sh \
     /home/chaos/.config/autostart/phosh-autorotate.desktop || true
 
+# Map physical volume keys (adc-keys) to PipeWire volume changes in Phosh.
+cat > "${ROOTFS_MNT}/home/chaos/.local/bin/phosh-volume-keys.sh" << 'PHOSH_VOLUME_KEYS'
+#!/usr/bin/env bash
+set -euo pipefail
+
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+LOG_FILE="$RUNTIME_DIR/phosh-volume-keys.log"
+LOCK_FILE="$RUNTIME_DIR/phosh-volume-keys.lock"
+VOLUME_STEP="${VOLUME_STEP:-5}"
+VOLUME_MAX="${VOLUME_MAX:-1.5}"
+ADC_RAW_FILE="${ADC_RAW_FILE:-/sys/bus/iio/devices/iio:device0/in_voltage1_raw}"
+ADC_PLUS_MAX="${ADC_PLUS_MAX:-120}"
+ADC_DOWN_MIN="${ADC_DOWN_MIN:-650}"
+ADC_DOWN_MAX="${ADC_DOWN_MAX:-920}"
+ADC_POLL_INTERVAL="${ADC_POLL_INTERVAL:-0.05}"
+ADC_STABLE_POLLS="${ADC_STABLE_POLLS:-2}"
+EVENT_DEV="${EVENT_DEV:-}"
+
+log() {
+  printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG_FILE"
+}
+
+find_volume_event() {
+  local dev
+  if [[ -n "$EVENT_DEV" && -r "$EVENT_DEV" ]]; then
+    echo "$EVENT_DEV"
+    return 0
+  fi
+
+  dev="$(awk '
+    /^N: Name="adc-keys"/ { match_name=1; next }
+    match_name && /^H: Handlers=/ {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^event[0-9]+$/) {
+          print "/dev/input/" $i
+          exit
+        }
+      }
+    }
+  ' /proc/bus/input/devices 2>/dev/null || true)"
+
+  if [[ -n "$dev" && -r "$dev" ]]; then
+    echo "$dev"
+    return 0
+  fi
+
+  return 1
+}
+
+volume_up() {
+  wpctl set-volume -l "$VOLUME_MAX" @DEFAULT_AUDIO_SINK@ "${VOLUME_STEP}%+" >/dev/null 2>&1 || true
+  wpctl set-mute @DEFAULT_AUDIO_SINK@ 0 >/dev/null 2>&1 || true
+}
+
+volume_down() {
+  wpctl set-volume @DEFAULT_AUDIO_SINK@ "${VOLUME_STEP}%-" >/dev/null 2>&1 || true
+}
+
+adc_state_for_raw() {
+  local raw="$1"
+  if (( raw <= ADC_PLUS_MAX )); then
+    echo "up"
+  elif (( raw >= ADC_DOWN_MIN && raw <= ADC_DOWN_MAX )); then
+    echo "down"
+  else
+    echo "none"
+  fi
+}
+
+if ! command -v wpctl >/dev/null 2>&1; then
+  log "wpctl not found; exiting"
+  exit 0
+fi
+
+mkdir -p "$RUNTIME_DIR"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  exit 0
+fi
+
+for _ in $(seq 1 40); do
+  if wpctl status >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.5
+done
+
+# Prefer direct ADC sampling. On some units, both physical keys are reported as
+# KEY_VOLUMEUP by the kernel input layer; ADC ranges still distinguish them.
+if [[ -r "$ADC_RAW_FILE" ]]; then
+  log "using adc mode raw_file=$ADC_RAW_FILE up<=${ADC_PLUS_MAX} down=${ADC_DOWN_MIN}-${ADC_DOWN_MAX}"
+  pending="none"
+  pending_count=0
+  active="none"
+
+  while true; do
+    raw="$(cat "$ADC_RAW_FILE" 2>/dev/null || true)"
+    if [[ ! "$raw" =~ ^[0-9]+$ ]]; then
+      sleep "$ADC_POLL_INTERVAL"
+      continue
+    fi
+
+    candidate="$(adc_state_for_raw "$raw")"
+    if [[ "$candidate" == "$pending" ]]; then
+      pending_count=$((pending_count + 1))
+    else
+      pending="$candidate"
+      pending_count=1
+    fi
+
+    if (( pending_count >= ADC_STABLE_POLLS )) && [[ "$candidate" != "$active" ]]; then
+      active="$candidate"
+      case "$active" in
+        up)
+          log "adc volume up raw=$raw"
+          volume_up
+          ;;
+        down)
+          log "adc volume down raw=$raw"
+          volume_down
+          ;;
+      esac
+    fi
+
+    sleep "$ADC_POLL_INTERVAL"
+  done
+fi
+
+while true; do
+  dev="$(find_volume_event || true)"
+  if [[ -z "$dev" ]]; then
+    log "volume input device not found; retrying"
+    sleep 2
+    continue
+  fi
+
+  log "listening on ${dev}"
+  evtest --grab "$dev" 2>/dev/null | while IFS= read -r line; do
+    case "$line" in
+      *"KEY_VOLUMEUP), value 1"*|*"KEY_VOLUMEUP), value 2"*|*"KEY_UP), value 1"*|*"KEY_UP), value 2"*)
+        log "evtest volume up"
+        volume_up
+        ;;
+      *"KEY_VOLUMEDOWN), value 1"*|*"KEY_VOLUMEDOWN), value 2"*|*"KEY_DOWN), value 1"*|*"KEY_DOWN), value 2"*)
+        log "evtest volume down"
+        volume_down
+        ;;
+    esac
+  done
+
+  log "evtest stream ended; restarting"
+  sleep 1
+done
+PHOSH_VOLUME_KEYS
+chmod +x "${ROOTFS_MNT}/home/chaos/.local/bin/phosh-volume-keys.sh"
+
+cat > "${ROOTFS_MNT}/home/chaos/.config/autostart/phosh-volume-keys.desktop" << 'PHOSH_VOLUME_KEYS_DESKTOP'
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Phosh Volume Keys
+Comment=Map physical volume keys to audio sink volume
+Exec=/home/chaos/.local/bin/phosh-volume-keys.sh
+OnlyShowIn=Phosh;
+X-GNOME-Autostart-enabled=true
+NoDisplay=true
+PHOSH_VOLUME_KEYS_DESKTOP
+
+mkdir -p "${ROOTFS_MNT}/home/chaos/.config/systemd/user/default.target.wants"
+cat > "${ROOTFS_MNT}/home/chaos/.config/systemd/user/phosh-volume-keys.service" << 'PHOSH_VOLUME_KEYS_SERVICE'
+[Unit]
+Description=Map physical volume keys to audio sink volume
+After=graphical-session.target pipewire.service
+Wants=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/home/chaos/.local/bin/phosh-volume-keys.sh
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=default.target
+PHOSH_VOLUME_KEYS_SERVICE
+ln -sf ../phosh-volume-keys.service \
+    "${ROOTFS_MNT}/home/chaos/.config/systemd/user/default.target.wants/phosh-volume-keys.service"
+
+chroot "${ROOTFS_MNT}" chown chaos:chaos \
+    /home/chaos/.local/bin/phosh-volume-keys.sh \
+    /home/chaos/.config/autostart/phosh-volume-keys.desktop \
+    /home/chaos/.config/systemd/user/phosh-volume-keys.service || true
+
 # Prevent duplicate/competing keyboards when reusing an old rootfs tree.
 cat > "${ROOTFS_MNT}/home/chaos/.config/autostart/onboard.desktop" << 'ONBOARD_HIDE'
 [Desktop Entry]
@@ -1262,6 +1529,28 @@ cat > "${ROOTFS_MNT}/home/chaos/.config/autostart/${desktop}" << 'AUTOSTART_HIDE
 Hidden=true
 AUTOSTART_HIDE
 chroot "${ROOTFS_MNT}" chown chaos:chaos "/home/chaos/.config/autostart/${desktop}" || true
+done
+
+# Hide launcher entries that are not useful in the tablet image.
+mkdir -p "${ROOTFS_MNT}/home/chaos/.local/share/applications"
+PHOSH_HIDE_LAUNCHERS="
+vim.desktop
+yelp.desktop
+org.gnome.Help.desktop
+org.gnome.Extensions.desktop
+org.gnome.Shell.Extensions.desktop
+debian-xterm.desktop
+debian-uxterm.desktop
+xterm.desktop
+uxterm.desktop
+"
+
+for desktop in ${PHOSH_HIDE_LAUNCHERS}; do
+cat > "${ROOTFS_MNT}/home/chaos/.local/share/applications/${desktop}" << 'LAUNCHER_HIDE'
+[Desktop Entry]
+Hidden=true
+LAUNCHER_HIDE
+chroot "${ROOTFS_MNT}" chown chaos:chaos "/home/chaos/.local/share/applications/${desktop}" || true
 done
 
 # Keep a fallback polkit agent autostart for Phosh sessions.

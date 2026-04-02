@@ -36,7 +36,8 @@
 		vol-down-key {
 			label = "volume down";
 			linux,code = <KEY_VOLUMEDOWN>;
-			press-threshold-microvolt = <297500>;
+			/* Match Android DTB: this board's VOL- ladder sits near ~1.35V. */
+			press-threshold-microvolt = <1350000>;
 		};
 	};
 
