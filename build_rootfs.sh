@@ -175,7 +175,7 @@ apt-get install -y sudo curl wget nano vim openssh-server network-manager wpasup
     wireless-regdb firmware-brcm80211 \
     gnome-themes-extra gnome-themes-extra-data adwaita-icon-theme \
     packagekit flatpak appstream xdg-desktop-portal \
-    dolphin plasma-discover
+    dolphin plasma-discover okular
 
 # Remove any Trixie apt source that may be left over from a previous failed
 # build attempt.  Trixie packages require libc6 >= 2.38 which Bookworm does
@@ -236,26 +236,28 @@ for camera_pkg in v4l-utils libcamera-tools; do
     fi
 done
 
-# Install at least one GUI camera app when available.
-camera_app_installed=0
-for camera_app_pkg in snapshot cheese; do
-    pkg_ver=$(apt-cache policy "${camera_app_pkg}" 2>/dev/null | awk '/Candidate:/{print $2}')
-    if [ -n "${pkg_ver}" ] && [ "${pkg_ver}" != "(none)" ]; then
-        if apt-get install -y "${camera_app_pkg}"; then
-            camera_app_installed=1
-            break
-        fi
-    fi
-done
-if [ "${camera_app_installed}" -eq 0 ]; then
-    echo "[!] Warning: no GUI camera app package available (snapshot/cheese)."
+# Install Snapshot when available as the GUI camera app.
+snapshot_ver=$(apt-cache policy snapshot 2>/dev/null | awk '/Candidate:/{print $2}')
+if [ -n "${snapshot_ver}" ] && [ "${snapshot_ver}" != "(none)" ]; then
+    apt-get install -y snapshot || \
+        echo "[!] Warning: snapshot install failed, skipping"
+else
+    echo "[!] Warning: snapshot not available on current mirror."
 fi
+
+# Ensure reused rootfs trees do not keep a previously installed Cheese stack.
+if dpkg-query -W -f='${Status}' cheese 2>/dev/null | grep -q "install ok installed"; then
+    echo "[*] Purging stale camera package: cheese"
+    apt-get purge -y cheese || true
+fi
+rm -f /usr/share/dbus-1/services/org.gnome.Cheese.service \
+      /etc/dconf/db/local.d/30-cheese-camera
 
 # App store source: Flathub remote for Flatpak.
 if command -v flatpak >/dev/null 2>&1; then
     flatpak remote-add --if-not-exists flathub \
         https://flathub.org/repo/flathub.flatpakrepo || \
-        echo "[!] Warning: failed to add Flathub remote."
+            echo "[!] Warning: failed to add Flathub remote."
 fi
 
 # Chromium is often smoother than Firefox on this board for YouTube playback.
@@ -2372,6 +2374,25 @@ if [ -f "${ROOT_DIR}/overlay/usb-mode-switch.sh" ] && [ -f "${ROOT_DIR}/overlay/
     chroot "${ROOTFS_MNT}" systemctl enable usb-role-manager.service
 fi
 
+# 10b. Front camera ISP setup service (s5k5e8 → rkisp → /dev/video22 NV12)
+if [ -f "${ROOT_DIR}/overlay/camera-isp-setup.sh" ] && \
+   [ -f "${ROOT_DIR}/overlay/camera-isp-setup.service" ]; then
+    echo "[*] Installing front camera ISP setup service..."
+
+    # Cross-compile config_isp helper if source is present and cross-compiler available
+    if [ -f "${ROOT_DIR}/tools/config_isp.c" ] && command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
+        aarch64-linux-gnu-gcc -O2 -o "${ROOTFS_MNT}/usr/local/bin/config_isp" \
+            "${ROOT_DIR}/tools/config_isp.c" && \
+            echo "[*] config_isp compiled for arm64" || \
+            echo "[!] Warning: config_isp compilation failed — ISP crop reset won't run"
+    fi
+
+    cp "${ROOT_DIR}/overlay/camera-isp-setup.sh" "${ROOTFS_MNT}/usr/local/bin/camera-isp-setup.sh"
+    chmod +x "${ROOTFS_MNT}/usr/local/bin/camera-isp-setup.sh"
+    cp "${ROOT_DIR}/overlay/camera-isp-setup.service" "${ROOTFS_MNT}/etc/systemd/system/camera-isp-setup.service"
+    chroot "${ROOTFS_MNT}" systemctl enable camera-isp-setup.service
+fi
+
 # 10b. (removed) rk817-hard-poweroff userspace service was removed.
 # The kernel's rk817_battery_shutdown() now saves dsoc/capacity before
 # pm_power_off_prepare runs, and rk817_shutdown_prepare() writes DEV_OFF
@@ -2426,6 +2447,8 @@ PATH=/usr/sbin:/usr/bin:/sbin:/bin
 LOG_FILE="/var/log/rk-battery-gauge-fix.log"
 CAP_FILE="/sys/class/power_supply/battery/capacity"
 VOLT_FILE="/sys/class/power_supply/battery/voltage_now"
+LOW_SOC_FIX_MAX=35
+HIGH_VOLTAGE_FIX_UV=4000000
 
 say() {
     echo "[$(date -Iseconds)] rk-battery-gauge-fix: $*" >> "${LOG_FILE}"
@@ -2484,16 +2507,20 @@ volt="$(read_int_file "${VOLT_FILE}")"
 [ -z "${cap}" ] && cap=0
 [ -z "${volt}" ] && volt=0
 
-# Trigger only on suspicious state:
-# - battery reports 0%
-# - but voltage is high enough to likely not be empty, or charger is connected
-if [ "${cap}" -ne 0 ]; then
+# Trigger only on suspicious states:
+# - battery reports 0% with non-empty voltage / charger online
+# - battery reports very low SOC, but pack voltage is clearly high
+fix_reason=""
+if [ "${cap}" -eq 0 ]; then
+    if [ "${volt}" -lt 3600000 ] && ! is_power_online; then
+        say "capacity=0 and low voltage (${volt}uV) with no charger: likely real empty, no fix"
+        exit 0
+    fi
+    fix_reason="capacity=0 voltage_now=${volt}uV"
+elif [ "${cap}" -le "${LOW_SOC_FIX_MAX}" ] && [ "${volt}" -ge "${HIGH_VOLTAGE_FIX_UV}" ]; then
+    fix_reason="capacity=${cap}% but voltage_now=${volt}uV suggests stuck-low gauge"
+else
     say "capacity=${cap}% voltage_now=${volt}uV: no fix needed"
-    exit 0
-fi
-
-if [ "${volt}" -lt 3600000 ] && ! is_power_online; then
-    say "capacity=0 and low voltage (${volt}uV) with no charger: likely real empty, no fix"
     exit 0
 fi
 
@@ -2503,7 +2530,7 @@ if [ -z "${i2c_bus}" ]; then
     exit 0
 fi
 
-say "detected possible stuck gauge (capacity=0 voltage_now=${volt}uV), applying fix on i2c-${i2c_bus}"
+say "detected possible stuck gauge (${fix_reason}), applying fix on i2c-${i2c_bus}"
 if command -v i2cget >/dev/null 2>&1; then
     gg_sts_raw="$(i2cget -f -y "${i2c_bus}" 0x20 0x57 2>/dev/null || true)"
     case "${gg_sts_raw}" in
@@ -2585,23 +2612,12 @@ PATH=/usr/sbin:/usr/bin:/sbin:/bin
 I2C_BUS=0
 PMIC_ADDR=0x20
 SYS_CFG3_REG=0xf4
-GG_STS_REG=0x57
 
 log() {
     echo "rk817-devoff: $*" > /dev/kmsg 2>/dev/null || true
 }
 
 if command -v i2cget >/dev/null 2>&1 && command -v i2cset >/dev/null 2>&1; then
-    # Match kernel patch behavior: set BAT_CON before DEV_OFF.
-    raw57="$(i2cget -y -f "${I2C_BUS}" "${PMIC_ADDR}" "${GG_STS_REG}" b 2>/dev/null || true)"
-    case "${raw57}" in
-        0x[0-9a-fA-F]|0x[0-9a-fA-F][0-9a-fA-F])
-            val57=$(( (raw57 | 0x10) & 0xff ))
-            i2cset -y -f "${I2C_BUS}" "${PMIC_ADDR}" "${GG_STS_REG}" "${val57}" b >/dev/null 2>&1 || true
-            log "GG_STS ${raw57} -> $(printf '0x%02x' "${val57}")"
-            ;;
-    esac
-
     raw="$(i2cget -y -f "${I2C_BUS}" "${PMIC_ADDR}" "${SYS_CFG3_REG}" b 2>/dev/null || true)"
     case "${raw}" in
         0x[0-9a-fA-F]|0x[0-9a-fA-F][0-9a-fA-F])

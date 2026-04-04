@@ -1,0 +1,481 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * RK3562 RK817 tablet camera graph.
+ *
+ * Camera rails are mapped to match the Android DTB wiring:
+ *   avdd  -> vcc_mipipwr
+ *   dovdd -> vcc1v8_dvp
+ *   dvdd  -> vcc1v2_dvp
+ *
+ * Keep Android candidate sensors in DT. Candidates without a matching
+ * upstream driver in this kernel are kept disabled.
+ *
+ * DEBUG MODE:
+ * Force camera rails to stay on at boot so we can verify sensor probe
+ * behavior independently of runtime PM.
+ */
+/ {
+	vcc_mipipwr: vcc-mipipwr-regulator {
+		compatible = "regulator-fixed";
+		gpio = <&gpio3 RK_PB3 GPIO_ACTIVE_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&mipicam_pwr>;
+		regulator-name = "vcc_mipipwr";
+		regulator-always-on;
+		regulator-boot-on;
+		enable-active-high;
+	};
+};
+
+&csi2_dphy0 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			mipi_in_s5k4h5yb: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&s5k4h5yb_out0>;
+				data-lanes = <1 2>;
+			};
+
+			mipi_in_ov8858: endpoint@2 {
+				reg = <2>;
+				remote-endpoint = <&ov8858_out0>;
+				data-lanes = <1 2 3 4>;
+			};
+
+			mipi_in_s5k4h5yc: endpoint@3 {
+				reg = <3>;
+				remote-endpoint = <&s5k4h5yc_out0>;
+				data-lanes = <1 2 3 4>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			csidphy0_out: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&mipi0_csi2_input>;
+				data-lanes = <1 2>;
+			};
+		};
+	};
+};
+
+&csi2_dphy4 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			mipi_in_ov5648: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&ov5648_out0>;
+				data-lanes = <1 2>;
+			};
+
+			mipi_in_gc5035: endpoint@2 {
+				reg = <2>;
+				remote-endpoint = <&gc5035_out0>;
+				data-lanes = <1 2>;
+			};
+
+			mipi_in_s5k5e8: endpoint@3 {
+				reg = <3>;
+				remote-endpoint = <&s5k5e8_out0>;
+				data-lanes = <1 2>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			csidphy4_out: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&mipi2_csi2_input>;
+				data-lanes = <1 2>;
+			};
+		};
+	};
+};
+
+&i2c4 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c4m0_xfer>;
+
+	fp5510: fp5510@c {
+		compatible = "fitipower,fp5510";
+		status = "okay";
+		reg = <0x0c>;
+		pwdn-gpios = <&gpio3 RK_PC1 GPIO_ACTIVE_HIGH>;
+		rockchip,vcm-start-current = <8>;
+		rockchip,vcm-rated-current = <72>;
+		rockchip,vcm-step-mode = <13>;
+		rockchip,camera-module-index = <0>;
+		rockchip,camera-module-facing = "back";
+	};
+
+	dw9714: dw9714@c {
+		compatible = "dongwoon,dw9714";
+		status = "disabled";
+		reg = <0x0c>;
+		avdd-supply = <&vcc1v8_dvp>;
+		xsd-gpios = <&gpio3 RK_PC1 GPIO_ACTIVE_HIGH>;
+		rockchip,camera-module-index = <0>;
+		rockchip,camera-module-facing = "back";
+		rockchip,vcm-start-current = <5>;
+		rockchip,vcm-rated-current = <90>;
+		rockchip,vcm-step-mode = <5>;
+	};
+
+	cn3927v: cn3927v@c {
+		compatible = "chipnext,cn3927v";
+		status = "disabled";
+		reg = <0x0c>;
+		avdd-supply = <&vcc_mipipwr>;
+		xsd-gpios = <&gpio3 RK_PC1 GPIO_ACTIVE_HIGH>;
+		rockchip,vcm-max-current = <1023>;
+		rockchip,vcm-start-current = <170>;
+		rockchip,vcm-rated-current = <768>;
+		rockchip,vcm-step-mode = <8>;
+		rockchip,vcm-edlc-enable = <0>;
+		rockchip,vcm-dlc-enable = <0>;
+		rockchip,vcm-mclk = <1>;
+		rockchip,vcm-t-src = <0>;
+		rockchip,vcm-adcanced-mode = <1>;
+		rockchip,vcm-sac-mode = <2>;
+		rockchip,vcm-sac-time = <80>;
+		rockchip,vcm-prescl = <1>;
+		rockchip,camera-module-index = <0>;
+		rockchip,camera-module-facing = "back";
+	};
+
+	/*
+	 * Board diagnostics:
+	 * - back sensor responds as S5K4H5YB on 0x36
+	 * - front sensor responds as S5K5E8 on 0x10
+	 * Keep legacy OV/GC nodes disabled to avoid probing the wrong chips.
+	 */
+	ov8858: ov8858@36 {
+		status = "disabled";
+		compatible = "ovti,ov8858";
+		reg = <0x36>;
+		clocks = <&cru CLK_CAM0_OUT2IO>;
+		clock-names = "xvclk";
+		reset-gpios = <&gpio3 RK_PB5 GPIO_ACTIVE_HIGH>;
+		pwdn-gpios = <&gpio3 RK_PB4 GPIO_ACTIVE_HIGH>;
+		avdd-supply = <&vcc_mipipwr>;
+		dovdd-supply = <&vcc1v8_dvp>;
+		dvdd-supply = <&vcc1v2_dvp>;
+		rockchip,camera-module-index = <0>;
+		rockchip,camera-module-facing = "back";
+		rockchip,camera-module-name = "KYT-10203-v1";
+		rockchip,camera-module-lens-name = "default";
+		lens-focus = <&fp5510>;
+
+		port {
+			ov8858_out0: endpoint {
+				remote-endpoint = <&mipi_in_ov8858>;
+				data-lanes = <1 2 3 4>;
+			};
+		};
+	};
+
+	ov5648: ov5648@35 {
+		status = "disabled";
+		compatible = "ovti,ov5648";
+		reg = <0x35>;
+		clocks = <&cru CLK_CAM0_OUT2IO>;
+		clock-names = "xvclk";
+		pwdn-gpios = <&gpio3 RK_PC0 GPIO_ACTIVE_HIGH>;
+		avdd-supply = <&vcc_mipipwr>;
+		dovdd-supply = <&vcc1v8_dvp>;
+		dvdd-supply = <&vcc1v2_dvp>;
+		rockchip,camera-module-index = <1>;
+		rockchip,camera-module-facing = "front";
+		rockchip,camera-module-name = "HS5885-BNSM1018-V01";
+		rockchip,camera-module-lens-name = "default";
+
+		port {
+			ov5648_out0: endpoint {
+				remote-endpoint = <&mipi_in_ov5648>;
+				data-lanes = <1 2>;
+			};
+		};
+	};
+
+	gc5035: gc5035@37 {
+		compatible = "galaxycore,gc5035";
+		status = "disabled";
+		reg = <0x37>;
+		clocks = <&cru CLK_CAM0_OUT2IO>;
+		clock-names = "xvclk";
+		pwdn-gpios = <&gpio3 RK_PC0 GPIO_ACTIVE_HIGH>;
+		avdd-supply = <&vcc_mipipwr>;
+		dovdd-supply = <&vcc1v8_dvp>;
+		dvdd-supply = <&vcc1v2_dvp>;
+		rockchip,camera-module-index = <1>;
+		rockchip,camera-module-facing = "front";
+		rockchip,camera-module-name = "KYT-8789-V10";
+		rockchip,camera-module-lens-name = "default";
+
+		port {
+			gc5035_out0: endpoint {
+				remote-endpoint = <&mipi_in_gc5035>;
+				data-lanes = <1 2>;
+			};
+		};
+	};
+
+	s5k5e8: s5k5e8@10 {
+		status = "okay";
+		compatible = "samsung,s5k5e8";
+		reg = <0x10>;
+		clocks = <&cru CLK_CAM0_OUT2IO>;
+		clock-names = "xvclk";
+		pwdn-gpios = <&gpio3 RK_PC0 GPIO_ACTIVE_HIGH>;
+		avdd-supply = <&vcc_mipipwr>;
+		dovdd-supply = <&vcc1v8_dvp>;
+		dvdd-supply = <&vcc1v2_dvp>;
+		rockchip,camera-module-index = <1>;
+		rockchip,camera-module-facing = "front";
+		rockchip,camera-module-name = "KYT-11327-V1.0";
+		rockchip,camera-module-lens-name = "default";
+
+		port {
+			s5k5e8_out0: endpoint {
+				remote-endpoint = <&mipi_in_s5k5e8>;
+				data-lanes = <1 2>;
+			};
+		};
+	};
+
+	s5k4h5yb: s5k4h5yb@36 {
+		status = "okay";
+		compatible = "samsung,s5k4h5yb";
+		reg = <0x36>;
+		clocks = <&cru CLK_CAM0_OUT2IO>;
+		clock-names = "xvclk";
+		reset-gpios = <&gpio3 RK_PB5 GPIO_ACTIVE_HIGH>;
+		pwdn-gpios = <&gpio3 RK_PB4 GPIO_ACTIVE_HIGH>;
+		avdd-supply = <&vcc_mipipwr>;
+		dovdd-supply = <&vcc1v8_dvp>;
+		dvdd-supply = <&vcc1v2_dvp>;
+		rockchip,camera-module-index = <0>;
+		rockchip,camera-module-facing = "back";
+		rockchip,camera-module-name = "G1-T-B-s5k";
+		rockchip,camera-module-lens-name = "XA-0806B";
+		lens-focus = <&fp5510>;
+
+		port {
+			s5k4h5yb_out0: endpoint {
+				remote-endpoint = <&mipi_in_s5k4h5yb>;
+				data-lanes = <1 2>;
+			};
+		};
+	};
+
+	s5k4h5yc: s5k4h5yc@33 {
+		status = "disabled";
+		compatible = "samsung,s5k4h5yc";
+		reg = <0x33>;
+		clocks = <&cru CLK_CAM0_OUT2IO>;
+		clock-names = "xvclk";
+		reset-gpios = <&gpio3 RK_PB5 GPIO_ACTIVE_LOW>;
+		pwdn-gpios = <&gpio3 RK_PB4 GPIO_ACTIVE_HIGH>;
+		avdd-supply = <&vcc_mipipwr>;
+		dovdd-supply = <&vcc1v8_dvp>;
+		dvdd-supply = <&vcc1v2_dvp>;
+		rockchip,camera-module-index = <0>;
+		rockchip,camera-module-facing = "back";
+		rockchip,camera-module-name = "G1-T-B-s5k";
+		rockchip,camera-module-lens-name = "XA-0806B";
+		lens-focus = <&fp5510>;
+
+		port {
+			s5k4h5yc_out0: endpoint {
+				remote-endpoint = <&mipi_in_s5k4h5yc>;
+				data-lanes = <1 2 3 4>;
+			};
+		};
+	};
+};
+
+&csi2_dphy0_hw {
+	status = "okay";
+};
+
+&csi2_dphy1_hw {
+	status = "okay";
+};
+
+&mipi0_csi2 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			mipi0_csi2_input: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&csidphy0_out>;
+				data-lanes = <1 2>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			mipi0_csi2_output: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&cif_mipi_in>;
+				data-lanes = <1 2>;
+			};
+		};
+	};
+};
+
+&mipi2_csi2 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			mipi2_csi2_input: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&csidphy4_out>;
+				data-lanes = <1 2>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			mipi2_csi2_output: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&cif_mipi_in2>;
+				data-lanes = <1 2>;
+			};
+		};
+	};
+};
+
+&rkcif {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&camm0_clk0_out>;
+};
+
+&rkcif_mipi_lvds {
+	status = "okay";
+
+	port {
+		cif_mipi_in: endpoint {
+			remote-endpoint = <&mipi0_csi2_output>;
+		};
+	};
+};
+
+&rkcif_mipi_lvds2 {
+	status = "okay";
+
+	port {
+		cif_mipi_in2: endpoint {
+			remote-endpoint = <&mipi2_csi2_output>;
+		};
+	};
+};
+
+&rkcif_mipi_lvds_sditf {
+	status = "okay";
+
+	port {
+		mipi_lvds_sditf: endpoint {
+			remote-endpoint = <&isp_vir0_in0>;
+		};
+	};
+};
+
+&rkcif_mipi_lvds2_sditf {
+	status = "okay";
+
+	port {
+		mipi_lvds2_sditf: endpoint {
+			remote-endpoint = <&isp_vir0_in1>;
+		};
+	};
+};
+
+&rkcif_mmu {
+	status = "okay";
+};
+
+&rkisp {
+	status = "okay";
+};
+
+&rkisp_mmu {
+	status = "okay";
+};
+
+&rkisp_vir0 {
+	status = "okay";
+
+	port {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		isp_vir0_in0: endpoint@0 {
+			reg = <0>;
+			remote-endpoint = <&mipi_lvds_sditf>;
+		};
+		isp_vir0_in1: endpoint@1 {
+			reg = <1>;
+			remote-endpoint = <&mipi_lvds2_sditf>;
+		};
+	};
+};
+
+&pinctrl {
+	cam {
+		mipicam_pwr: mipicam-pwr {
+			rockchip,pins =
+				/* camera power en */
+				<3 RK_PB3 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+};

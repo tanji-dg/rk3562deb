@@ -23,3 +23,20 @@ mali/
 
 # Local SDK selection cache
 .rk_lunch
+
+# Git worktrees
+.worktrees/
+
+# Compiled tool binaries (built from tools/*.c by build.sh or manually)
+tools/capture_front
+tools/capture_isp
+tools/config_isp
+
+# Debug/scratch files
+*.raw
+*.pgm
+*.yuv
+*.png
+rk3562_android.dts
+plan.md
+",i+1*

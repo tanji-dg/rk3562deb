@@ -1,0 +1,14 @@
+[Unit]
+Description=Front camera ISP pipeline setup (s5k5e8 → rkisp → /dev/video22)
+After=systemd-udevd.service sys-subsystem-media.device
+Wants=sys-subsystem-media.device
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/camera-isp-setup.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -163,7 +163,9 @@ module_param_named(dbg_level, dbg_enable, int, 0644);
 
 #define FINISH_CHRG_CUR1		1000
 #define FINISH_CHRG_CUR2		1500
+#define FINISH_CHRG_CUR3		6000
 #define FINISH_MAX_SOC_DELAY		20
+#define FINISH_LARGE_SOC_DELAY		40
 #define TERM_CHRG_DSOC			88
 #define TERM_CHRG_CURR			600
 #define TERM_CHRG_K			650
@@ -1667,7 +1669,7 @@ static void rk817_bat_not_first_pwron(struct rk817_battery_device *battery)
 		ocv_cap = rk817_bat_vol_to_cap(battery, ocv_vol);
 		battery->force_pre_dsoc = pre_soc;
 		battery->force_new_dsoc = ocv_soc;
-		if (abs(ocv_soc - pre_soc) >= 80 * 1000) {
+		if (abs(ocv_soc - pre_soc) >= 40 * 1000) {
 			battery->is_force_calib = true;
 			BAT_INFO("dsoc force calib: %d -> %d\n",
 				 pre_soc, ocv_soc);
@@ -2778,8 +2780,12 @@ static void rk817_bat_finish_algorithm(struct rk817_battery_device *battery)
 		if (!battery->finish_base)
 			battery->finish_base = get_boot_sec();
 
-		finish_current = (battery->rsoc - battery->dsoc) > FINISH_MAX_SOC_DELAY ?
-					FINISH_CHRG_CUR2 : FINISH_CHRG_CUR1;
+		if ((battery->rsoc - battery->dsoc) > FINISH_LARGE_SOC_DELAY * 1000)
+			finish_current = FINISH_CHRG_CUR3;
+		else if ((battery->rsoc - battery->dsoc) > FINISH_MAX_SOC_DELAY * 1000)
+			finish_current = FINISH_CHRG_CUR2;
+		else
+			finish_current = FINISH_CHRG_CUR1;
 		finish_sec = base2sec(battery->finish_base);
 
 		soc_sec = battery->fcc * 3600 / 100 / DIV(finish_current);

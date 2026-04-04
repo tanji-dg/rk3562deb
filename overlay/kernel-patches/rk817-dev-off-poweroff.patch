@@ -18,7 +18,7 @@ index d89f97913..b58d838b4 100644
  
  	/* close rtc int when power off */
  	regmap_update_bits(rk808->regmap,
-@@ -937,37 +943,44 @@ static int rk817_shutdown_prepare(struct sys_off_data *data)
+@@ -937,37 +943,37 @@ static int rk817_shutdown_prepare(struct sys_off_data *data)
  			   RK817_RTC_INT_REG,
  			   (0x3 << 2), (0x0 << 2));
  
@@ -29,13 +29,6 @@ index d89f97913..b58d838b4 100644
 -					 SLPPIN_NULL_FUN);
 -		if (ret)
 -			pr_err("shutdown: config SLPPIN_NULL_FUN error!\n");
-+	/*
-+	 * Set BAT_CON so the gauge re-initialises from OCV on next boot.
-+	 * Full DEV_OFF drops the cached SOC registers.
-+	 */
-+	raw = i2c_smbus_read_byte_data(client, 0x57);
-+	if (raw >= 0)
-+		i2c_smbus_write_byte_data(client, 0x57, (u8)(raw | BIT(4)));
  
 -		ret = regmap_update_bits(rk808->regmap,
 -					 RK817_SYS_CFG(3),
