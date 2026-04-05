@@ -161,6 +161,7 @@ apt-get install -y sudo curl wget nano vim openssh-server network-manager wpasup
     network-manager-gnome bluez blueman policykit-1-gnome \
     xorg xserver-xorg xserver-xorg-input-libinput firefox-esr mesa-utils libgl1-mesa-dri mesa-vulkan-drivers \
     pipewire pipewire-audio pipewire-alsa pipewire-pulse wireplumber pavucontrol alsa-utils libasound2-plugins \
+    pipewire-libcamera libcamera-ipa libcamera-v4l2 \
     gedit \
     zram-tools \
     plymouth plymouth-themes \
@@ -175,7 +176,8 @@ apt-get install -y sudo curl wget nano vim openssh-server network-manager wpasup
     wireless-regdb firmware-brcm80211 \
     gnome-themes-extra gnome-themes-extra-data adwaita-icon-theme \
     packagekit flatpak appstream xdg-desktop-portal \
-    dolphin plasma-discover okular
+    dolphin plasma-discover okular \
+    gstreamer1.0-tools
 
 # Remove any Trixie apt source that may be left over from a previous failed
 # build attempt.  Trixie packages require libc6 >= 2.38 which Bookworm does
@@ -1024,42 +1026,11 @@ CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --disable-gpu"
 CHROMIUM_SW_FLAGS
 fi
 
-# Hide WWAN UI elements on non-cellular tablets. Phosh 0.24 keeps WWAN
-# controls visible (or leaves empty slots) even when no modem exists.
-echo "[*] Configuring Phosh WWAN UI overrides..."
-mkdir -p "${ROOTFS_MNT}/etc/phosh/resource-overrides/sm/puri/phosh/ui"
-if command -v gresource >/dev/null 2>&1; then
-    if gresource extract "${ROOTFS_MNT}/usr/libexec/phosh" /sm/puri/phosh/ui/settings.ui \
-        > "${ROOTFS_MNT}/etc/phosh/resource-overrides/sm/puri/phosh/ui/settings.ui"; then
-        # Remove WWAN quick-setting block entirely so GtkFlowBox does not
-        # reserve a blank tile.
-        perl -0777 -i -pe 's#\n\s*<child>\n\s*<object class="PhoshQuickSetting" id="wwan_quick_setting">[\s\S]*?</child>\n\s*<child>\n\s*<object class="PhoshQuickSetting" id="wifi_quick_setting">#\n                <child>\n                  <object class="PhoshQuickSetting" id="wifi_quick_setting">#s' \
-            "${ROOTFS_MNT}/etc/phosh/resource-overrides/sm/puri/phosh/ui/settings.ui"
-    else
-        echo "[!] Warning: could not extract Phosh settings UI resource; WWAN quick tile override skipped."
-    fi
-
-    if gresource extract "${ROOTFS_MNT}/usr/libexec/phosh" /sm/puri/phosh/ui/top-panel.ui \
-        > "${ROOTFS_MNT}/etc/phosh/resource-overrides/sm/puri/phosh/ui/top-panel.ui"; then
-        # Remove WWAN indicator from top panel network box.
-        perl -0777 -i -pe 's#\n\s*<child>\n\s*<object class="PhoshWWanInfo" id="wwaninfo">[\s\S]*?</child>\n\s*<child>\n\s*<object class="PhoshWifiInfo" id="wifiinfo">#\n                    <child>\n                      <object class="PhoshWifiInfo" id="wifiinfo">#s' \
-            "${ROOTFS_MNT}/etc/phosh/resource-overrides/sm/puri/phosh/ui/top-panel.ui"
-    else
-        echo "[!] Warning: could not extract Phosh top-panel UI resource; WWAN top-bar override skipped."
-    fi
-else
-    echo "[!] Warning: gresource not available on host; WWAN UI overrides skipped."
-fi
-
-cat > "${ROOTFS_MNT}/etc/profile.d/90-phosh-resource-overrides.sh" << 'PHOSH_RESOURCE_OVERLAY'
-# Ensure Phosh can override selected built-in GResources from filesystem.
-_PHOSH_OVERLAY="/sm/puri/phosh=/etc/phosh/resource-overrides/sm/puri/phosh"
-case ":${G_RESOURCE_OVERLAYS:-}:" in
-  *":${_PHOSH_OVERLAY}:"*) ;;
-  *) export G_RESOURCE_OVERLAYS="${_PHOSH_OVERLAY}${G_RESOURCE_OVERLAYS:+:${G_RESOURCE_OVERLAYS}}" ;;
-esac
-unset _PHOSH_OVERLAY
-PHOSH_RESOURCE_OVERLAY
+# Phosh resource overlays caused shell UI regressions after fullscreen
+# transitions on this image. Keep stock upstream resources for stability.
+echo "[*] Disabling Phosh GResource UI overrides..."
+rm -f "${ROOTFS_MNT}/etc/profile.d/90-phosh-resource-overrides.sh"
+rm -rf "${ROOTFS_MNT}/etc/phosh/resource-overrides/sm/puri/phosh"
 
 # 8. Setting hostname and fstab
 echo "[*] Setting hostname and fstab..."
@@ -1623,6 +1594,178 @@ chroot "${ROOTFS_MNT}" chown -R chaos:chaos \
     /home/chaos/.local \
     /home/chaos/.cache \
     /home/chaos/Desktop || true
+
+# Expose the RKISP front camera as a PipeWire Video/Source for browser apps.
+# The kernel camera nodes are multiplanar V4L2 devices; this bridge publishes a
+# webcam-style source named "Front_Camera" in the user PipeWire graph.
+echo "[*] Installing PipeWire webcam bridge for front camera..."
+mkdir -p "${ROOTFS_MNT}/home/chaos/.local/bin"
+cat > "${ROOTFS_MNT}/home/chaos/.local/bin/rkcam-webcam.sh" << 'RKCAM_WEBCAM'
+#!/bin/sh
+set -eu
+
+exec gst-launch-1.0 -q \
+  v4l2src device=/dev/video22 io-mode=2 ! \
+  video/x-raw,format=UYVY,width=1280,height=720,framerate=30/1 ! \
+  pipewiresink mode=provide \
+    stream-properties="props,media.class=Video/Source,media.role=Camera,node.name=rkcam-webcam,node.description=Front_Camera,node.nick=Front_Camera"
+RKCAM_WEBCAM
+chmod +x "${ROOTFS_MNT}/home/chaos/.local/bin/rkcam-webcam.sh"
+
+mkdir -p "${ROOTFS_MNT}/home/chaos/.config/systemd/user/default.target.wants"
+cat > "${ROOTFS_MNT}/home/chaos/.config/systemd/user/rkcam-webcam.service" << 'RKCAM_WEBCAM_UNIT'
+[Unit]
+Description=RK front camera PipeWire webcam bridge
+After=pipewire.service wireplumber.service
+Wants=pipewire.service wireplumber.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/rkcam-webcam.sh
+# Refresh portal camera inventory after source appears (works around race)
+ExecStartPost=/bin/sh -c 'sleep 1; systemctl --user restart xdg-desktop-portal.service xdg-desktop-portal-gnome.service || true'
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+RKCAM_WEBCAM_UNIT
+ln -sfn /home/chaos/.config/systemd/user/rkcam-webcam.service \
+    "${ROOTFS_MNT}/home/chaos/.config/systemd/user/default.target.wants/rkcam-webcam.service"
+
+chroot "${ROOTFS_MNT}" chown -R chaos:chaos \
+    /home/chaos/.local/bin/rkcam-webcam.sh \
+    /home/chaos/.config/systemd/user/rkcam-webcam.service \
+    /home/chaos/.config/systemd/user/default.target.wants/rkcam-webcam.service || true
+
+# Force RK817 into a stable capture profile after PipeWire is ready.
+echo "[*] Installing RK817 pro-audio profile helper..."
+cat > "${ROOTFS_MNT}/home/chaos/.local/bin/rk-audio-pro.sh" << 'RK_AUDIO_PRO'
+#!/bin/sh
+set -eu
+
+PATH=/usr/bin:/bin
+
+if ! command -v pactl >/dev/null 2>&1; then
+    exit 0
+fi
+
+for _ in $(seq 1 40); do
+    pactl info >/dev/null 2>&1 || {
+        sleep 1
+        continue
+    }
+    if pactl list short cards 2>/dev/null | awk '$2 == "alsa_card.platform-rk817-sound" {found=1} END{exit(found?0:1)}'; then
+        break
+    fi
+    sleep 1
+done
+
+pactl set-card-profile alsa_card.platform-rk817-sound pro-audio >/dev/null 2>&1 || \
+pactl set-card-profile alsa_card.platform-rk817-sound output:stereo-fallback+input:stereo-fallback >/dev/null 2>&1 || true
+
+SINK="$(pactl list short sinks 2>/dev/null | awk '$2 ~ /^alsa_output\.platform-rk817-sound\.pro-output-0$/ {print $2; exit} $2 ~ /^alsa_output\.platform-rk817-sound\.stereo-fallback$/ {print $2; exit}' || true)"
+SRC="$(pactl list short sources 2>/dev/null | awk '$2 ~ /^alsa_input\.platform-rk817-sound\.pro-input-0$/ {print $2; exit} $2 ~ /^alsa_input\.platform-rk817-sound\.stereo-fallback$/ {print $2; exit}' || true)"
+
+if [ -n "${SINK}" ]; then
+    pactl set-default-sink "${SINK}" >/dev/null 2>&1 || true
+fi
+if [ -n "${SRC}" ]; then
+    pactl set-default-source "${SRC}" >/dev/null 2>&1 || true
+    pactl set-source-mute "${SRC}" 0 >/dev/null 2>&1 || true
+fi
+
+exit 0
+RK_AUDIO_PRO
+chmod +x "${ROOTFS_MNT}/home/chaos/.local/bin/rk-audio-pro.sh"
+
+cat > "${ROOTFS_MNT}/home/chaos/.config/systemd/user/rk-audio-pro.service" << 'RK_AUDIO_PRO_UNIT'
+[Unit]
+Description=Force pro-audio profile for RK817 card
+After=pipewire-pulse.service
+Wants=pipewire-pulse.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/rk-audio-pro.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=default.target
+RK_AUDIO_PRO_UNIT
+ln -sfn /home/chaos/.config/systemd/user/rk-audio-pro.service \
+    "${ROOTFS_MNT}/home/chaos/.config/systemd/user/default.target.wants/rk-audio-pro.service"
+
+chroot "${ROOTFS_MNT}" chown -R chaos:chaos \
+    /home/chaos/.local/bin/rk-audio-pro.sh \
+    /home/chaos/.config/systemd/user/rk-audio-pro.service \
+    /home/chaos/.config/systemd/user/default.target.wants/rk-audio-pro.service || true
+
+echo "[*] Skipping virtual microphone source (prefer hardware mic by default)."
+rm -f \
+    "${ROOTFS_MNT}/home/chaos/.local/bin/rk-virtual-mic.sh" \
+    "${ROOTFS_MNT}/home/chaos/.config/systemd/user/rk-virtual-mic.service" \
+    "${ROOTFS_MNT}/home/chaos/.config/systemd/user/default.target.wants/rk-virtual-mic.service"
+
+# Launch browsers with native PipeWire camera support enabled.
+# This avoids relying on pw-v4l2, which can hang on some builds.
+echo "[*] Installing browser wrappers for PipeWire camera..."
+mkdir -p "${ROOTFS_MNT}/home/chaos/.local/bin" \
+         "${ROOTFS_MNT}/home/chaos/.local/share/applications"
+
+cat > "${ROOTFS_MNT}/home/chaos/.local/bin/chromium-pwcam" << 'CHROMIUM_PWCAM'
+#!/bin/bash
+set -euo pipefail
+
+args=()
+for arg in "$@"; do
+  if [[ "$arg" == "--use-fake-ui-for-media-stream" ]]; then
+    continue
+  fi
+  args+=("$arg")
+done
+
+exec chromium \
+  --ozone-platform-hint=auto \
+  --enable-features=UseOzonePlatform,WebRtcPipeWireCamera \
+  "${args[@]}"
+CHROMIUM_PWCAM
+chmod +x "${ROOTFS_MNT}/home/chaos/.local/bin/chromium-pwcam"
+
+cat > "${ROOTFS_MNT}/home/chaos/.local/bin/firefox-pwcam" << 'FIREFOX_PWCAM'
+#!/bin/sh
+set -eu
+exec env -u MOZ_X11_EGL \
+  MOZ_DISABLE_RDD_SANDBOX=1 \
+  MOZ_ENABLE_WAYLAND=1 \
+  MOZ_WAYLAND_USE_VAAPI=1 \
+  MOZ_DRM_DEVICE=/dev/dri/renderD128 \
+  LIBVA_DRIVER_NAME=rockchip \
+  /usr/lib/firefox-esr/firefox-esr \
+  --setpref media.webrtc.capture.allow-pipewire=true \
+  --setpref media.webrtc.camera.allow-pipewire=true \
+  "$@"
+FIREFOX_PWCAM
+chmod +x "${ROOTFS_MNT}/home/chaos/.local/bin/firefox-pwcam"
+
+if [ -f "${ROOTFS_MNT}/usr/share/applications/chromium.desktop" ]; then
+    cp -f "${ROOTFS_MNT}/usr/share/applications/chromium.desktop" \
+          "${ROOTFS_MNT}/home/chaos/.local/share/applications/chromium.desktop"
+    sed -i 's|^Exec=.*|Exec=/home/chaos/.local/bin/chromium-pwcam %U|' \
+          "${ROOTFS_MNT}/home/chaos/.local/share/applications/chromium.desktop"
+fi
+
+if [ -f "${ROOTFS_MNT}/usr/share/applications/firefox-esr.desktop" ]; then
+    cp -f "${ROOTFS_MNT}/usr/share/applications/firefox-esr.desktop" \
+          "${ROOTFS_MNT}/home/chaos/.local/share/applications/firefox-esr.desktop"
+    sed -i 's|^Exec=.*|Exec=/home/chaos/.local/bin/firefox-pwcam %u|' \
+          "${ROOTFS_MNT}/home/chaos/.local/share/applications/firefox-esr.desktop"
+fi
+
+chroot "${ROOTFS_MNT}" chown -R chaos:chaos \
+    /home/chaos/.local/bin/chromium-pwcam \
+    /home/chaos/.local/bin/firefox-pwcam \
+    /home/chaos/.local/share/applications || true
 
 # Power key: short press = suspend, long press = poweroff
 mkdir -p "${ROOTFS_MNT}/etc/systemd/logind.conf.d"
@@ -2286,10 +2429,21 @@ if [ -r /proc/asound/cards ]; then
 fi
 
 if [ -n "$rk_card" ]; then
-    for path in SPK_HP SPK HP RCV; do
+    for path in SPK SPK_HP HP RCV; do
         /usr/bin/amixer -q -c "$rk_card" cset name='Playback Path' "$path" >/dev/null 2>&1 && break
     done
+    /usr/bin/amixer -q -c "$rk_card" cset name='DAC Playback Volume' 230,230 >/dev/null 2>&1 || true
+    /usr/bin/amixer -q -c "$rk_card" sset 'DAC' 230,230 >/dev/null 2>&1 || true
+    /usr/bin/amixer -q -c "$rk_card" sset 'HP Output Gain' 3 >/dev/null 2>&1 || true
+    /usr/bin/amixer -q -c "$rk_card" cset name='Speaker Switch' on >/dev/null 2>&1 || true
+    /usr/bin/amixer -q -c "$rk_card" sset 'spk switch' on >/dev/null 2>&1 || true
+    /usr/bin/amixer -q -c "$rk_card" sset 'hp switch' off >/dev/null 2>&1 || true
     /usr/bin/amixer -q -c "$rk_card" cset name='Capture MIC Path' 'Main Mic' >/dev/null 2>&1 || true
+    /usr/bin/amixer -q -c "$rk_card" sset 'Main Mic' on >/dev/null 2>&1 || true
+    /usr/bin/amixer -q -c "$rk_card" sset 'Headset Mic' off >/dev/null 2>&1 || true
+    /usr/bin/amixer -q -c "$rk_card" sset 'ADC' 255,255 >/dev/null 2>&1 || true
+    /usr/bin/amixer -q -c "$rk_card" sset 'ADC PGA Gain' 15,15 >/dev/null 2>&1 || true
+    /usr/bin/amixer -q -c "$rk_card" sset 'MIC Boost Gain' 3,3 >/dev/null 2>&1 || true
     /usr/bin/amixer -q -c "$rk_card" cset name='Capture Volume' 192 >/dev/null 2>&1 || true
     /usr/bin/amixer -q -c "$rk_card" cset name='PCM' 192 >/dev/null 2>&1 || true
 fi
@@ -2336,14 +2490,14 @@ for _ in $(seq 1 20); do
     sleep 1
 done
 
-sink="$(pactl list short sinks 2>/dev/null | awk '/rockchip|rk817|analog-stereo/ {print $2; exit}' || true)"
+sink="$(pactl list short sinks 2>/dev/null | awk '$2 ~ /^alsa_output\.platform-rk817-sound\./ && $2 !~ /\.monitor$/ {print $2; exit} $2 ~ /analog-stereo/ && $2 !~ /\.monitor$/ {print $2; exit}' || true)"
 if [ -n "${sink}" ]; then
     pactl set-default-sink "${sink}" >/dev/null 2>&1 || true
     pactl set-sink-mute "${sink}" 0 >/dev/null 2>&1 || true
     pactl set-sink-volume "${sink}" 100% >/dev/null 2>&1 || true
 fi
 
-source="$(pactl list short sources 2>/dev/null | awk '/rockchip|rk817|analog-stereo/ {print $2; exit}' || true)"
+source="$(pactl list short sources 2>/dev/null | awk '$2 ~ /^alsa_input\.platform-rk817-sound\./ {print $2; exit} $2 ~ /analog-stereo/ && $2 !~ /\.monitor$/ && $2 != "virtual-mic" {print $2; exit}' || true)"
 if [ -n "${source}" ]; then
     pactl set-default-source "${source}" >/dev/null 2>&1 || true
     pactl set-source-mute "${source}" 0 >/dev/null 2>&1 || true
