@@ -460,6 +460,22 @@ build_kernel() {
         fi
     fi
 
+    # RK817 boot SOC OCV calibration fix:
+    # always recalibrate dsoc/cap from PMIC OCV register at boot so the
+    # battery percentage reflects real pack voltage, not stale scratch state.
+    local rk817_boot_ocv_patch="${ROOT_DIR}/overlay/kernel-patches/rk817-boot-ocv-calibration.patch"
+    if [ -f "${rk817_boot_ocv_patch}" ]; then
+        if grep -q "boot OCV calib" drivers/power/supply/rk817_battery.c; then
+            echo "[*] RK817 boot OCV calibration fix already present."
+        else
+            echo "[*] Applying RK817 boot OCV calibration fix..."
+            if ! git apply --whitespace=nowarn "${rk817_boot_ocv_patch}"; then
+                echo "[-] Error: failed to apply RK817 boot OCV calibration fix."
+                exit 1
+            fi
+        fi
+    fi
+
     # Use the configured defconfig, with a rockchip fallback if needed.
     if [ ! -f "arch/arm64/configs/${KERNEL_DEFCONFIG}" ]; then
         echo "Warning: ${KERNEL_DEFCONFIG} not found. Attempting rockchip_linux_defconfig..."
