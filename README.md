@@ -21,6 +21,7 @@ The resulting image is written to an SD card. Insert it and power on — the tab
 | Component | Details |
 |-----------|---------|
 | SoC | Rockchip RK3562 (4× Cortex-A53 @ 2.0 GHz) |
+| NPU | 1× Rockchip NPU core (active for RKLLM inference) |
 | RAM | 4 GB LPDDR4 |
 | Storage | 128 GB eMMC (Android) + SD card (Debian) |
 | Display | 10.1" DSI panel, 1280×800 |
@@ -39,16 +40,84 @@ The resulting image is written to an SD card. Insert it and power on — the tab
 | **Speaker / Audio output** | ✅ Full |
 | **Microphone** | ✅ Full |
 | **3D Acceleration** | ⚠️ Partial (Panfrost, OpenGL ES works) |
+| **NPU (RKLLM / rknn-llm)** | ✅ Active (RK3562 supports one NPU core, `num_npu_core=1`) |
 | **Accelerometer** | ✅ Full (SC7A20 / DA223) |
+| **Cameras** | ⚠️ WIP (front camera partially working) |
 | **Battery / Charging** | ✅ Full (RK817 PMIC) |
 | **SD card boot** | ✅ Full |
 | **USB OTG** | ✅ Full |
 
-## What Does Not Work
+## Default Installed Apps
 
-| Feature | Status |
-|---------|--------|
-| **Cameras** | ❌ Not supported |
+| App | Notes |
+|-----|-------|
+| **Firefox ESR** | Preinstalled web browser |
+| **Chromium** | Preinstalled web browser (installed when available on mirror) |
+| **Drawing** | Touch-friendly paint app (installed when available on mirror) |
+| **Snapshot** | Camera app (installed when available on mirror) |
+| **Dolphin** | File manager |
+| **Plasma Discover** | App store / software center |
+| **Okular** | Document/PDF viewer |
+| **Gedit** | Text editor |
+| **Pavucontrol** | Audio controls |
+| **Terminal** | `kgx` preferred, `gnome-terminal` fallback |
+| **Flatpak + Flathub** | Enabled by default for app installs |
+
+## NPU LLM (RK3562)
+
+This tablet image supports local LLM inference on the RK3562 NPU using Rockchip's RKLLM stack.
+
+### NPU software used
+
+- [airockchip/rknn-llm](https://github.com/airockchip/rknn-llm) — runtime, RKLLM toolkit, demo app (`llm_demo`)
+- [airockchip/rknn-toolkit2](https://github.com/airockchip/rknn-toolkit2) — RKNN conversion/toolchain dependency used by RKLLM workflows
+
+### Model conversion setup used
+
+- Target platform: `rk3562`
+- Quantization: `W8A8`
+- NPU cores: `num_npu_core=1` (RK3562 supports one NPU core)
+- Optimization level: `0` (chosen for compatibility/stability on this board)
+
+Example conversion command (host PC):
+
+```bash
+python3 convert_qwen_rk3562.py \
+  --model-dir ./models/Qwen3-0.6B \
+  --target-platform rk3562 \
+  --quantized-dtype W8A8 \
+  --optimization-level 0 \
+  --num-npu-core 1 \
+  --output ./out/Qwen3-0.6B_W8A8_RK3562_opt0.rkllm
+```
+
+### Benchmark (on tablet, NPU path)
+
+Measured on **April 6, 2026** on `chaos@192.168.2.109` with:
+- prompt: `Output exactly 300 English words about arithmetic speed testing do not include punctuation and do not stop early`
+- `MAX_NEW_TOKENS=64`, `MAX_CONTEXT_LEN=1024`
+- runner: `~/npu-test/xcompile/demo_Linux_aarch64/run_llm_rk3562.sh`
+
+Commands used:
+
+```bash
+# Qwen3-0.6B (first run includes fix_freq)
+USE_FIX_FREQ=1 RKLLM_LOG_LEVEL=1 PROMPT="Output exactly 300 English words about arithmetic speed testing do not include punctuation and do not stop early" \
+  ./run_llm_rk3562.sh ~/npu-test/models/Qwen3-0.6B_W8A8_RK3562_opt0.rkllm 64 1024
+
+# Qwen2.5-1.5B
+USE_FIX_FREQ=0 RKLLM_LOG_LEVEL=1 PROMPT="Output exactly 300 English words about arithmetic speed testing do not include punctuation and do not stop early" \
+  ./run_llm_rk3562.sh ~/npu-test/models/Qwen2.5-1.5B-Instruct_W8A8_RK3562.rkllm 64 1024
+```
+
+Warm-run average (runs 2-3):
+
+| Model | Init Time (ms) | Prefill (tok/s) | Generate (tok/s) |
+|-------|-----------------|-----------------|------------------|
+| `Qwen3-0.6B_W8A8_RK3562_opt0` | `1788.70` | `57.62` | `4.92` |
+| `Qwen2.5-1.5B-Instruct_W8A8_RK3562` | `4800.76` | `42.78` | `2.18` |
+
+Result: `Qwen3-0.6B` is significantly faster on this RK3562 tablet for local NPU inference.
 
 ---
 
