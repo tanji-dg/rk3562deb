@@ -363,6 +363,16 @@ cat > /etc/dconf/db/local.d/20-rkdebian-phosh-wwan << 'PHOSH_WWAN_DCONF'
 [sm/puri/phosh]
 wwan-backend='ofono'
 PHOSH_WWAN_DCONF
+
+# Phosh 0.24 lockscreen forces portrait orientation internally.
+# Keep screen blanking but disable lockscreen to avoid portrait-only wake/login.
+cat > /etc/dconf/db/local.d/21-rkdebian-phosh-lockscreen << 'PHOSH_LOCK_DCONF'
+[org/gnome/desktop/screensaver]
+lock-enabled=false
+
+[org/gnome/desktop/lockdown]
+disable-lock-screen=true
+PHOSH_LOCK_DCONF
 dconf update >/dev/null 2>&1 || true
 
 # Automatically power adapters when bluetoothd starts.
