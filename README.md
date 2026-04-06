@@ -125,6 +125,7 @@ These variables can be set before running `build.sh` to control build behaviour:
 | `RKDEBIAN_DISPLAY_SERVER` | `wayland` | Session backend preference for desktop stack selection (`wayland`, `x11`, or `auto`). Phosh images use Wayland by default. |
 | `RKDEBIAN_UI_SESSION` | `phosh` | UI session to auto-login in LightDM. Current supported value: `phosh`. |
 | `RKDEBIAN_GPU_STACK` | `mali` | GPU stack to build for: `mali` (vendor userspace) or `panfrost` (Mesa/Panfrost, no `libmali`). |
+| `RKDEBIAN_CPU_GOVERNOR` | `performance` | Baseline CPU governor used at boot and as the default mapping for Phosh `balanced` mode. |
 | `RKDEBIAN_MALI_GBM_PROVIDER` | `vendor` | Mali-only option: `vendor` keeps `mali/libgbm.so.1` from the blob package (default), `debian` overrides it to Debian `libgbm.so.1` for compatibility testing. |
 
 ### Kernel
@@ -158,6 +159,9 @@ RKDEBIAN_KEEP_OVERLAY_PMIC_PATCHES=1 ./build.sh extboot
 # Force a Wayland desktop image for testing
 ./build.sh all --display-server=wayland
 
+# Override baseline governor used for Phosh balanced mode mapping
+RKDEBIAN_CPU_GOVERNOR=schedutil ./build.sh all
+
 # Build a Phosh image on Mesa/Panfrost (clean rootfs strongly advised)
 ./build.sh all --ui-session=phosh --gpu-stack=panfrost --force-clean-rootfs
 
@@ -166,6 +170,17 @@ RKDEBIAN_MALI_GBM_PROVIDER=debian ./build.sh all --ui-session=phosh --gpu-stack=
 ```
 
 When changing `RKDEBIAN_UI_SESSION` or `RKDEBIAN_GPU_STACK`, use `--force-clean-rootfs` to avoid stale package carry-over.
+
+### Phosh Power Mode Mapping
+
+Images include `rk-power-profile-sync.service`, which maps Phosh power modes
+(`power-profiles-daemon`) to cpufreq policy on-device:
+
+- `balanced` -> governor from `RKDEBIAN_CPU_GOVERNOR` (default `performance`), max freq cap `100%`
+- `power-saver` -> governor `powersave`, max freq cap `65%`
+- `performance` (if exposed by hardware) -> governor `performance`, max freq cap `100%`
+
+Tune mapping on-device in `/etc/default/rk-power-profile-map`.
 
 ### Safe Phosh Session Testing (on-device)
 

@@ -171,7 +171,7 @@ apt-get install -y sudo curl wget nano vim openssh-server network-manager wpasup
     python3 python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 \
     qt6-wayland \
     i2c-tools \
-    iproute2 iputils-ping dnsutils locales tzdata upower brightnessctl rfkill \
+    iproute2 iputils-ping dnsutils locales tzdata upower power-profiles-daemon brightnessctl rfkill \
     vainfo vdpauinfo \
     wireless-regdb firmware-brcm80211 \
     gnome-themes-extra gnome-themes-extra-data adwaita-icon-theme \
@@ -2563,7 +2563,7 @@ fi
 # directly via i2c_smbus.  A userspace service running before systemd-poweroff
 # would kill the PMIC before the kernel can save battery state.
 
-# 10c. Power tuning service (WiFi power-save, CPU governor)
+# 10c. Power tuning service (WiFi power-save + Phosh power-profile CPU mapping)
 echo "[*] Installing power tuning service..."
 cat > "${ROOTFS_MNT}/usr/local/sbin/rk-power-tune.sh" << RK_POWER_TUNE
 #!/bin/sh
@@ -2577,7 +2577,8 @@ for iface in wlan0 wlan1; do
     fi
 done
 
-# Keep the CPU governor biased toward UI responsiveness on this tablet.
+# Keep a responsive baseline governor until the profile-sync daemon below
+# applies the current power profile mapping.
 for policy in /sys/devices/system/cpu/cpufreq/policy*; do
     [ -f "\$policy/scaling_governor" ] || continue
     echo "\$CPU_GOVERNOR" > "\$policy/scaling_governor" 2>/dev/null || true
@@ -2600,6 +2601,200 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 RK_POWER_TUNE_UNIT
 chroot "${ROOTFS_MNT}" systemctl enable rk-power-tune.service
+
+# Map power-profiles-daemon profiles to cpufreq behavior so Phosh's
+# "Balanced" and "Power Saver" switch directly controls CPU policy.
+cat > "${ROOTFS_MNT}/etc/default/rk-power-profile-map" << RK_POWER_PROFILE_MAP
+# Profile to governor mapping for rk-power-profile-sync.sh
+# Valid governors: performance, schedutil, ondemand, powersave, conservative, userspace
+RK_POWER_BALANCED_GOVERNOR="${RKDEBIAN_CPU_GOVERNOR}"
+RK_POWER_SAVER_GOVERNOR="powersave"
+RK_POWER_PERFORMANCE_GOVERNOR="performance"
+
+# Max frequency cap (percentage of cpuinfo_max_freq) per profile.
+RK_POWER_BALANCED_MAX_PCT="100"
+RK_POWER_SAVER_MAX_PCT="65"
+RK_POWER_PERFORMANCE_MAX_PCT="100"
+
+# Polling interval (seconds) for profile changes.
+RK_POWER_PROFILE_POLL_SEC="2"
+RK_POWER_PROFILE_MAP
+
+cat > "${ROOTFS_MNT}/usr/local/sbin/rk-power-profile-sync.sh" << 'RK_POWER_PROFILE_SYNC'
+#!/bin/sh
+set -eu
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+CONF_FILE="/etc/default/rk-power-profile-map"
+
+RK_POWER_BALANCED_GOVERNOR="performance"
+RK_POWER_SAVER_GOVERNOR="powersave"
+RK_POWER_PERFORMANCE_GOVERNOR="performance"
+RK_POWER_BALANCED_MAX_PCT="100"
+RK_POWER_SAVER_MAX_PCT="65"
+RK_POWER_PERFORMANCE_MAX_PCT="100"
+RK_POWER_PROFILE_POLL_SEC="2"
+
+if [ -r "${CONF_FILE}" ]; then
+    # shellcheck disable=SC1090
+    . "${CONF_FILE}"
+fi
+
+is_uint() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+sanitize_pct() {
+    val="$1"
+    def="$2"
+    if is_uint "${val}" && [ "${val}" -ge 1 ] && [ "${val}" -le 100 ] 2>/dev/null; then
+        echo "${val}"
+    else
+        echo "${def}"
+    fi
+}
+
+sanitize_poll() {
+    val="$1"
+    if is_uint "${val}" && [ "${val}" -ge 1 ] 2>/dev/null; then
+        echo "${val}"
+    else
+        echo "2"
+    fi
+}
+
+RK_POWER_BALANCED_MAX_PCT="$(sanitize_pct "${RK_POWER_BALANCED_MAX_PCT}" "100")"
+RK_POWER_SAVER_MAX_PCT="$(sanitize_pct "${RK_POWER_SAVER_MAX_PCT}" "65")"
+RK_POWER_PERFORMANCE_MAX_PCT="$(sanitize_pct "${RK_POWER_PERFORMANCE_MAX_PCT}" "100")"
+RK_POWER_PROFILE_POLL_SEC="$(sanitize_poll "${RK_POWER_PROFILE_POLL_SEC}")"
+
+log_msg() {
+    logger -t rk-power-profile-sync "$*" 2>/dev/null || true
+}
+
+is_governor_available() {
+    gov="$1"
+    for policy in /sys/devices/system/cpu/cpufreq/policy*; do
+        [ -r "${policy}/scaling_available_governors" ] || continue
+        tr ' ' '\n' < "${policy}/scaling_available_governors" | grep -qx "${gov}" && return 0
+    done
+    return 1
+}
+
+choose_governor() {
+    requested="$1"
+    fallback_list="$2"
+    if is_governor_available "${requested}"; then
+        echo "${requested}"
+        return 0
+    fi
+    for gov in ${fallback_list}; do
+        if is_governor_available "${gov}"; then
+            echo "${gov}"
+            return 0
+        fi
+    done
+    echo ""
+    return 1
+}
+
+read_profile() {
+    if ! command -v powerprofilesctl >/dev/null 2>&1; then
+        echo "balanced"
+        return 0
+    fi
+
+    profile="$(powerprofilesctl get 2>/dev/null || true)"
+    case "${profile}" in
+        power-saver|balanced|performance) echo "${profile}" ;;
+        *) echo "balanced" ;;
+    esac
+}
+
+apply_profile() {
+    profile="$1"
+    case "${profile}" in
+        power-saver)
+            requested_governor="${RK_POWER_SAVER_GOVERNOR}"
+            max_pct="${RK_POWER_SAVER_MAX_PCT}"
+            fallback="powersave conservative schedutil ondemand interactive performance userspace"
+            ;;
+        performance)
+            requested_governor="${RK_POWER_PERFORMANCE_GOVERNOR}"
+            max_pct="${RK_POWER_PERFORMANCE_MAX_PCT}"
+            fallback="performance schedutil ondemand interactive conservative powersave userspace"
+            ;;
+        *)
+            requested_governor="${RK_POWER_BALANCED_GOVERNOR}"
+            max_pct="${RK_POWER_BALANCED_MAX_PCT}"
+            fallback="performance schedutil ondemand interactive conservative powersave userspace"
+            ;;
+    esac
+
+    chosen_governor="$(choose_governor "${requested_governor}" "${fallback}" || true)"
+
+    for policy in /sys/devices/system/cpu/cpufreq/policy*; do
+        [ -d "${policy}" ] || continue
+
+        if [ -n "${chosen_governor}" ] && [ -w "${policy}/scaling_governor" ]; then
+            echo "${chosen_governor}" > "${policy}/scaling_governor" 2>/dev/null || true
+        fi
+
+        if [ -r "${policy}/cpuinfo_max_freq" ] && [ -r "${policy}/cpuinfo_min_freq" ] && [ -w "${policy}/scaling_max_freq" ]; then
+            max_freq="$(tr -cd '0-9' < "${policy}/cpuinfo_max_freq")"
+            min_freq="$(tr -cd '0-9' < "${policy}/cpuinfo_min_freq")"
+            if is_uint "${max_freq}" && [ "${max_freq}" -gt 0 ] 2>/dev/null; then
+                cap_freq=$((max_freq * max_pct / 100))
+                if is_uint "${min_freq}" && [ "${cap_freq}" -lt "${min_freq}" ] 2>/dev/null; then
+                    cap_freq="${min_freq}"
+                fi
+
+                if [ -w "${policy}/scaling_min_freq" ]; then
+                    cur_min="$(tr -cd '0-9' < "${policy}/scaling_min_freq" 2>/dev/null || true)"
+                    if is_uint "${cur_min}" && [ "${cur_min}" -gt "${cap_freq}" ] 2>/dev/null; then
+                        echo "${cap_freq}" > "${policy}/scaling_min_freq" 2>/dev/null || true
+                    fi
+                fi
+
+                echo "${cap_freq}" > "${policy}/scaling_max_freq" 2>/dev/null || true
+            fi
+        fi
+    done
+
+    log_msg "profile=${profile} requested_gov=${requested_governor} applied_gov=${chosen_governor:-none} max_pct=${max_pct}"
+}
+
+last_profile=""
+while :; do
+    profile="$(read_profile)"
+    if [ "${profile}" != "${last_profile}" ]; then
+        apply_profile "${profile}"
+        last_profile="${profile}"
+    fi
+    sleep "${RK_POWER_PROFILE_POLL_SEC}"
+done
+RK_POWER_PROFILE_SYNC
+chmod +x "${ROOTFS_MNT}/usr/local/sbin/rk-power-profile-sync.sh"
+
+cat > "${ROOTFS_MNT}/etc/systemd/system/rk-power-profile-sync.service" << 'RK_POWER_PROFILE_SYNC_UNIT'
+[Unit]
+Description=Sync CPU governor/frequency caps with Power Profiles mode
+After=power-profiles-daemon.service rk-power-tune.service
+Wants=power-profiles-daemon.service rk-power-tune.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/rk-power-profile-sync.sh
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+RK_POWER_PROFILE_SYNC_UNIT
+chroot "${ROOTFS_MNT}" systemctl enable rk-power-profile-sync.service
 
 # 10d. RK817 battery gauge recovery (fixes occasional false 0% after cold-off).
 echo "[*] Installing RK817 battery gauge recovery service..."
