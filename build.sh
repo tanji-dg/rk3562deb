@@ -245,7 +245,7 @@ EOF
 
 check_deps() {
     echo "[*] Checking dependencies..."
-    local deps=("git" "make" "aarch64-linux-gnu-gcc" "bc" "bison" "flex" "dtc" "genimage" "wget" "tar" "mcopy" "debootstrap" "qemu-aarch64-static" "mkfs.ext4" "e2fsck")
+    local deps=("git" "make" "aarch64-linux-gnu-gcc" "bc" "bison" "flex" "dtc" "genimage" "wget" "tar" "mcopy" "debootstrap" "qemu-aarch64-static" "mkfs.ext4" "e2fsck" "xz")
     for dep in "${deps[@]}"; do
         if ! command -v "$dep" >/dev/null 2>&1; then
             echo "[-] Error: Missing dependency: $dep. Please install it."
@@ -705,6 +705,9 @@ create_image() {
         --outputpath "${OUT_DIR}"
 
     cp -f "${OUT_DIR}/rk3562-debian.img" "${OUTPUT_DIR}/update/update.img"
+    echo "[*] Compressing final image with xz (-T0 -9e)..."
+    xz -T0 -9e -f -k "${OUT_DIR}/rk3562-debian.img"
+    cp -f "${OUT_DIR}/rk3562-debian.img.xz" "${OUTPUT_DIR}/update/update.img.xz"
 
     if [ -f "${OUT_DIR}/rootfs.ext4" ]; then
         ln -sfn "../out/rootfs.ext4" "${ROOT_DIR}/prebuilt_rootfs/rk3562_debian_rootfs.img"
@@ -713,7 +716,9 @@ create_image() {
     ensure_sdk_compat_layout
     
     echo "[+] Done! Image is available at ${OUT_DIR}/rk3562-debian.img"
+    echo "[+] Compressed image is available at ${OUT_DIR}/rk3562-debian.img.xz"
     echo "[+] Firefly-compatible image path: ${OUTPUT_DIR}/update/update.img"
+    echo "[+] Compressed Firefly-compatible image path: ${OUTPUT_DIR}/update/update.img.xz"
 }
 
 create_update_package() {

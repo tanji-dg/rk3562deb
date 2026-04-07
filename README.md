@@ -140,6 +140,7 @@ sudo apt-get install \
   git make gcc-aarch64-linux-gnu \
   bc bison flex device-tree-compiler \
   genimage wget tar mtools \
+  xz-utils \
   debootstrap qemu-user-static \
   e2fsprogs
 ```
@@ -156,9 +157,40 @@ Builds U-Boot, kernel, Debian rootfs, and produces a ready-to-flash SD card imag
 ./build.sh all
 ```
 
+With full logging to file (`tee`) while preserving the real build exit status:
+
+```bash
+set -o pipefail
+./build.sh all 2>&1 | tee build.log
+```
+
+`./build.sh` with no target defaults to `all`.
+
 The final image is written to:
-- `out/rk3562-debian.img` — write directly to SD card
-- `output/update/update.img` — Firefly-compatible path
+- `out/rk3562-debian.img.xz` — compressed final image (recommended)
+- `output/update/update.img.xz` — compressed Firefly-compatible path
+
+Compatibility/raw images are also kept:
+- `out/rk3562-debian.img`
+- `output/update/update.img`
+
+---
+
+### CLI usage and options
+
+```bash
+./build.sh [options] {check|lunch|uboot|extboot|updateimg|updatepkg|compile|rootfs|image|all}
+```
+
+| Option | Values | Description |
+|--------|--------|-------------|
+| `--ui-session` | `phosh` | Session profile to bake into the image |
+| `--gpu-stack` | `mali`, `panfrost` | Select userspace/kernel graphics stack |
+| `--display-server` | `auto`, `wayland`, `x11` | Desktop backend preference passed into rootfs build |
+| `--cpu-governor` | e.g. `performance`, `schedutil` | Baseline governor used by power-tuning services |
+| `--force-clean-rootfs` | flag | Force full rootfs rebuild (same effect as `RKDEBIAN_FORCE_CLEAN_ROOTFS=1`) |
+| `--no-force-clean-rootfs` | flag | Explicitly disable forced rootfs cleanup |
+| `-h`, `--help` | flag | Show usage |
 
 ---
 
@@ -170,12 +202,14 @@ The final image is written to:
 | `./build.sh lunch` | Select a build configuration (defconfig) |
 | `./build.sh uboot` | Build U-Boot only |
 | `./build.sh extboot` | Build the Linux kernel only |
-| `./build.sh rootfs` | Build the Debian 12 rootfs only |
+| `./build.sh rootfs` | Build the Debian 12 rootfs only, then verify the requested build profile marker |
 | `./build.sh compile` | Build U-Boot + kernel (skip rootfs and image) |
-| `./build.sh image` | Assemble the final SD card image from existing artifacts |
-| `./build.sh updateimg` | Alias for `image` |
-| `./build.sh updatepkg` | Create an offline update tarball (`output/update/update.tar.gz`) |
+| `./build.sh image` | Assemble the final SD card image from existing artifacts (with rootfs profile verification) |
+| `./build.sh updateimg` | Legacy image assembly path (SDK-compat); packages image without running profile verification |
+| `./build.sh updatepkg` | Create an offline update tarball (`output/update/update.tar.gz`) from `out/rootfs` + `out/boot/*` |
 | `./build.sh all` | Full end-to-end build (default) |
+
+`image` and `updatepkg` require existing build artifacts (`out/rootfs`, kernel/DTB, and boot config files).
 
 ---
 
@@ -210,6 +244,9 @@ These variables can be set before running `build.sh` to control build behaviour:
 # Force a clean rootfs rebuild
 RKDEBIAN_FORCE_CLEAN_ROOTFS=1 ./build.sh all
 
+# Same using CLI flags
+./build.sh all --force-clean-rootfs
+
 # Force clean rootfs rebuild with a fixed 4 GB rootfs partition
 RKDEBIAN_FORCE_CLEAN_ROOTFS=1 ROOTFS_IMAGE_SIZE=4G ./build.sh all
 
@@ -228,8 +265,14 @@ RKDEBIAN_KEEP_OVERLAY_PMIC_PATCHES=1 ./build.sh extboot
 # Force a Wayland desktop image for testing
 ./build.sh all --display-server=wayland
 
+# Explicitly disable force-clean (useful in scripted runs)
+./build.sh all --no-force-clean-rootfs
+
 # Override baseline governor used for Phosh balanced mode mapping
 RKDEBIAN_CPU_GOVERNOR=schedutil ./build.sh all
+
+# Show CLI usage and target list
+./build.sh --help
 
 # Build a Phosh image on Mesa/Panfrost (clean rootfs strongly advised)
 ./build.sh all --ui-session=phosh --gpu-stack=panfrost --force-clean-rootfs
@@ -287,7 +330,12 @@ This produces `output/update/update.tar.gz`.
 | `/home/chaos/update/` | Primary drop location |
 | `/update/pending/` | Alternative drop location |
 
-On the **next reboot**, the `rk-apply-update` service automatically detects the package, applies the rootfs and kernel/DTB payloads, then reboots to finalize. The applied package is moved to `/update/applied/` so the same package is never applied twice.
+On the **next reboot**, the `rk-apply-update` service automatically detects the newest `*.tar.gz` or `*.tgz` package, applies rootfs + boot payloads, then reboots to finalize. Legacy compatibility path `/update/update.tar.gz` is also checked.
+
+Package archive behavior:
+- Successfully applied packages are moved to `/update/applied/`
+- Invalid/extract-failed packages are moved to `/update/failed/`
+- Already-applied packages (same SHA-256) are moved to `/update/duplicate/`
 
 Update progress and errors are logged to `/var/log/rk-update.log`.
 
@@ -297,11 +345,11 @@ Update progress and errors are logged to `/var/log/rk-update.log`.
 
 ## Flashing to SD Card
 
-After a successful build, flash the image to your SD card:
+After a successful build, flash the compressed image to your SD card:
 
 ```bash
 # Replace /dev/sdX with your SD card device (check with lsblk)
-sudo dd if=out/rk3562-debian.img of=/dev/sdX bs=4M status=progress conv=fsync
+xz -dc out/rk3562-debian.img.xz | sudo dd of=/dev/sdX bs=4M status=progress conv=fsync
 ```
 
 > **Warning:** Double-check the device path. Writing to the wrong device will overwrite your data.
