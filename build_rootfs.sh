@@ -1623,10 +1623,13 @@ cat > "${ROOTFS_MNT}/home/chaos/.local/bin/rkcam-webcam.sh" << 'RKCAM_WEBCAM'
 #!/bin/sh
 set -eu
 
-exec gst-launch-1.0 -q \
-  v4l2src device=/dev/video22 io-mode=2 ! \
+# Keep pipeline simple/stable under Chromium capture.
+# io-mode=0 avoids DMABUF path; queue prevents stalls under load.
+exec gst-launch-1.0 --no-fault -q \
+  v4l2src device=/dev/video23 io-mode=0 do-timestamp=true ! \
   video/x-raw,format=UYVY,width=1280,height=720,framerate=30/1 ! \
-  pipewiresink mode=provide \
+  queue max-size-buffers=4 leaky=downstream ! \
+  pipewiresink mode=provide sync=false \
     stream-properties="props,media.class=Video/Source,media.role=Camera,node.name=rkcam-webcam,node.description=Front_Camera,node.nick=Front_Camera"
 RKCAM_WEBCAM
 chmod +x "${ROOTFS_MNT}/home/chaos/.local/bin/rkcam-webcam.sh"
@@ -1656,6 +1659,77 @@ chroot "${ROOTFS_MNT}" chown -R chaos:chaos \
     /home/chaos/.local/bin/rkcam-webcam.sh \
     /home/chaos/.config/systemd/user/rkcam-webcam.service \
     /home/chaos/.config/systemd/user/default.target.wants/rkcam-webcam.service || true
+
+# Install a launcher-friendly on-device front camera preview tool.
+mkdir -p "${ROOTFS_MNT}/home/chaos/.local/share/applications"
+cat > "${ROOTFS_MNT}/home/chaos/.local/bin/front-camera-preview.sh" << 'FRONT_CAM_PREVIEW'
+#!/bin/sh
+set -eu
+
+PATH=/usr/local/bin:/usr/bin:/bin
+export DISPLAY="${DISPLAY:-:0}"
+export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+
+MEDIA_DEV=""
+for dev in /dev/media0 /dev/media1 /dev/media2; do
+    [ -e "$dev" ] || continue
+    if media-ctl -d "$dev" -p 2>/dev/null | grep -q 'rkisp-isp-subdev'; then
+        MEDIA_DEV="$dev"
+        break
+    fi
+done
+
+if [ -z "$MEDIA_DEV" ]; then
+    echo "[front-camera-preview] ERROR: rkisp media graph not found"
+    exit 1
+fi
+
+# Keep webcam bridge from competing for /dev/video23 during preview.
+systemctl --user stop rkcam-webcam.service >/dev/null 2>&1 || true
+killall gst-launch-1.0 >/dev/null 2>&1 || true
+
+# Force front route + stable front ISP dimensions.
+media-ctl -d "$MEDIA_DEV" --links '"rkcif-mipi-lvds":0->"rkisp-isp-subdev":0[0]' >/dev/null 2>&1 || true
+media-ctl -d "$MEDIA_DEV" --links '"rkcif-mipi-lvds2":0->"rkisp-isp-subdev":0[1]' >/dev/null 2>&1 || true
+media-ctl -d "$MEDIA_DEV" --set-v4l2 '"rkcif-mipi-lvds2":0[fmt:SGRBG10_1X10/2592x1944]' >/dev/null 2>&1 || true
+media-ctl -d "$MEDIA_DEV" --set-v4l2 '"rkisp-isp-subdev":0[fmt:SGRBG10_1X10/2592x1944 crop:(0,0)/2592x1944]' >/dev/null 2>&1 || true
+media-ctl -d "$MEDIA_DEV" --set-v4l2 '"rkisp-isp-subdev":2[fmt:YUYV8_2X8/2592x1944 crop:(0,0)/2592x1944]' >/dev/null 2>&1 || true
+
+# Keep image visible when no 3A daemon is active.
+v4l2-ctl -d /dev/v4l-subdev6 -c test_pattern=0 >/dev/null 2>&1 || true
+v4l2-ctl -d /dev/v4l-subdev6 -c exposure=1964 >/dev/null 2>&1 || true
+v4l2-ctl -d /dev/v4l-subdev6 -c analogue_gain=1024 >/dev/null 2>&1 || true
+v4l2-ctl -d /dev/video23 --set-fmt-video=width=1280,height=720,pixelformat=UYVY >/dev/null 2>&1 || true
+
+cleanup() {
+    systemctl --user restart rkcam-webcam.service >/dev/null 2>&1 || true
+}
+trap cleanup EXIT INT TERM
+
+gst-launch-1.0 --no-fault \
+  v4l2src device=/dev/video23 io-mode=0 do-timestamp=true ! \
+  video/x-raw,format=UYVY,width=1280,height=720,framerate=15/1 ! \
+  videobalance brightness=0.25 contrast=1.6 ! \
+  videoconvert ! ximagesink sync=false
+FRONT_CAM_PREVIEW
+chmod +x "${ROOTFS_MNT}/home/chaos/.local/bin/front-camera-preview.sh"
+
+cat > "${ROOTFS_MNT}/home/chaos/.local/share/applications/front-camera-preview.desktop" << 'FRONT_CAM_DESKTOP'
+[Desktop Entry]
+Type=Application
+Name=Front Camera Preview
+Comment=Open a live front camera test window
+Exec=/home/chaos/.local/bin/front-camera-preview.sh
+Icon=camera-photo
+Categories=AudioVideo;Video;
+Terminal=false
+StartupNotify=true
+FRONT_CAM_DESKTOP
+
+chroot "${ROOTFS_MNT}" chown -R chaos:chaos \
+    /home/chaos/.local/bin/front-camera-preview.sh \
+    /home/chaos/.local/share/applications/front-camera-preview.desktop || true
 
 # Force RK817 into a stable capture profile after PipeWire is ready.
 echo "[*] Installing RK817 pro-audio profile helper..."
@@ -2547,7 +2621,7 @@ if [ -f "${ROOT_DIR}/overlay/usb-mode-switch.sh" ] && [ -f "${ROOT_DIR}/overlay/
     chroot "${ROOTFS_MNT}" systemctl enable usb-role-manager.service
 fi
 
-# 10b. Front camera ISP setup service (s5k5e8 → rkisp → /dev/video22 NV12)
+# 10b. Front camera ISP setup service (s5k5e8 → rkisp → /dev/video23)
 if [ -f "${ROOT_DIR}/overlay/camera-isp-setup.sh" ] && \
    [ -f "${ROOT_DIR}/overlay/camera-isp-setup.service" ]; then
     echo "[*] Installing front camera ISP setup service..."
