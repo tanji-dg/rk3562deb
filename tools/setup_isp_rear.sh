@@ -1,0 +1,270 @@
+#!/bin/bash
+# setup_isp_rear.sh — configure rear camera (s5k4h5yb) through ISP.
+#
+# Route: s5k4h5yb -> DPHY0 -> MIPI CSI2 -> rkcif-mipi-lvds -> rkisp -> /dev/video22
+# Default mode is 1920x1080 (works on current rear CIF path).
+#
+# Key fix:
+#   We must set the rear CIF pad format on the ISP media graph
+#   ("rkcif-mipi-lvds":0). If this is left stale from front-camera setup
+#   (2592x1944), rear output can appear gray/striped.
+#
+# Usage:
+#   bash setup_isp_rear.sh
+#
+# Optional env:
+#   REAR_W=1920 REAR_H=1080
+#   ISP_VIDEO_DEV=/dev/video22
+#   REAR_SENSOR_SUBDEV=/dev/v4l-subdev2
+#   REAR_SENSOR_ENTITY="m00_b_s5k4h5yb 4-0036"
+set -euo pipefail
+
+W="${REAR_W:-1920}"
+H="${REAR_H:-1080}"
+ISP_VIDEO_DEV="${ISP_VIDEO_DEV:-/dev/video22}"
+ISP_SUBDEV="${ISP_SUBDEV:-/dev/v4l-subdev7}"
+SENSOR_SUBDEV="${REAR_SENSOR_SUBDEV:-/dev/v4l-subdev2}"
+
+log() {
+    echo "[setup_isp_rear] $*"
+}
+
+require_cmd() {
+    local cmd="$1"
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        log "ERROR: missing required command: $cmd"
+        exit 1
+    fi
+}
+
+find_media_with_entity() {
+    local entity_pat="$1"
+    local dev
+    local topo
+    for dev in /dev/media0 /dev/media1 /dev/media2 /dev/media3; do
+        [ -e "$dev" ] || continue
+        topo="$(media-ctl -d "$dev" -p 2>/dev/null || true)"
+        if [[ "${topo}" == *"${entity_pat}"* ]]; then
+            echo "$dev"
+            return 0
+        fi
+    done
+    return 1
+}
+
+find_entity_name() {
+    local media_dev="$1"
+    local entity_pat="$2"
+    media-ctl -d "${media_dev}" -p 2>/dev/null | awk -v pat="${entity_pat}" '
+        /^- entity [0-9]+:/ {
+            name = $0
+            sub(/^- entity [0-9]+: /, "", name)
+            sub(/ \([0-9]+ pads?.*/, "", name)
+            if (name ~ pat) {
+                print name
+                exit
+            }
+        }
+    '
+}
+
+set_link() {
+    local media_dev="$1"
+    local spec="$2"
+    local i
+    for i in $(seq 1 20); do
+        if media-ctl -d "${media_dev}" --links "${spec}" >/dev/null 2>&1; then
+            log "link ok: ${spec}"
+            return 0
+        fi
+        sleep 0.2
+    done
+    log "ERROR: failed media link after retries: ${spec}"
+    return 1
+}
+
+set_pad() {
+    local media_dev="$1"
+    local spec="$2"
+    local i
+    for i in $(seq 1 20); do
+        if media-ctl -d "${media_dev}" --set-v4l2 "${spec}" >/dev/null 2>&1; then
+            log "pad ok: ${spec}"
+            return 0
+        fi
+        sleep 0.2
+    done
+    log "ERROR: failed pad format/crop after retries: ${spec}"
+    return 1
+}
+
+require_cmd media-ctl
+require_cmd v4l2-ctl
+
+ISP_MEDIA="${ISP_MEDIA:-$(find_media_with_entity 'rkisp-isp-subdev' || true)}"
+REAR_MEDIA="${REAR_MEDIA:-$(find_media_with_entity 'rockchip-csi2-dphy0' || true)}"
+
+if [ -z "${REAR_MEDIA}" ] && [ -e /dev/media0 ]; then
+    REAR_MEDIA="/dev/media0"
+    log "WARN: rear media auto-detect failed, falling back to ${REAR_MEDIA}"
+fi
+
+if [ -z "${ISP_MEDIA}" ]; then
+    log "ERROR: could not find ISP media device (entity: rkisp-isp-subdev)"
+    exit 1
+fi
+if [ -z "${REAR_MEDIA}" ]; then
+    log "ERROR: could not find rear camera media device (entity: rockchip-csi2-dphy0)"
+    exit 1
+fi
+
+log "ISP media device: ${ISP_MEDIA}"
+log "Rear media device: ${REAR_MEDIA}"
+
+if [ ! -e "${ISP_SUBDEV}" ]; then
+    auto_isp_subdev="$(media-ctl -d "${ISP_MEDIA}" -p 2>/dev/null \
+        | awk '
+            /rkisp-isp-subdev/ {seen=1}
+            seen && /device node name/ {print $NF; exit}
+        ')"
+    if [ -n "${auto_isp_subdev}" ]; then
+        ISP_SUBDEV="${auto_isp_subdev}"
+    fi
+fi
+log "ISP subdev path: ${ISP_SUBDEV}"
+
+REAR_SENSOR_ENTITY="${REAR_SENSOR_ENTITY:-$(find_entity_name "${REAR_MEDIA}" "s5k4h5yb" || true)}"
+if [ -n "${REAR_SENSOR_ENTITY}" ]; then
+    log "Rear sensor entity: ${REAR_SENSOR_ENTITY}"
+else
+    log "WARN: rear sensor entity name not found in topology; continuing without explicit sensor pad set."
+fi
+
+if [ ! -e "${ISP_VIDEO_DEV}" ] && [ "${ISP_VIDEO_DEV}" = "/dev/video22" ] && [ -e /dev/video23 ]; then
+    ISP_VIDEO_DEV="/dev/video23"
+fi
+log "Capture node: ${ISP_VIDEO_DEV}"
+
+echo "=== Step 1: Stop ISP-related user services ==="
+systemctl --user stop rkisp1-awb.service 2>/dev/null && log "Stopped rkisp1-awb.service" || true
+systemctl --user stop rkcam-webcam.service 2>/dev/null && log "Stopped rkcam-webcam.service" || true
+sleep 0.3
+
+echo ""
+echo "=== Step 2: Switch ISP input from front -> rear ==="
+if ! set_link "${ISP_MEDIA}" '"rkcif-mipi-lvds2":0 -> "rkisp-isp-subdev":0 [0]'; then
+    log "WARN: could not explicitly disable lvds2 link; continuing"
+fi
+REAR_ISP_LINKED=1
+if ! set_link "${ISP_MEDIA}" '"rkcif-mipi-lvds":0 -> "rkisp-isp-subdev":0 [1]'; then
+    log "WARN: rear->ISP link switch was rejected by kernel; falling back to raw rear capture"
+    REAR_ISP_LINKED=0
+fi
+
+if [ "${REAR_ISP_LINKED}" = "1" ]; then
+    echo ""
+    echo "=== Step 3: Pin rear CIF + CSI formats (${W}x${H}) ==="
+    # Critical: pin the rear CIF pad on ISP media graph to avoid stale front format.
+    set_pad "${ISP_MEDIA}" '"rkcif-mipi-lvds":0[fmt:SGRBG10_1X10/'"${W}x${H}"']'
+
+    # Rear raw chain on DPHY0/MIPI0 media graph.
+    if [ -n "${REAR_SENSOR_ENTITY}" ]; then
+        set_pad "${REAR_MEDIA}" "\"${REAR_SENSOR_ENTITY}\":0[fmt:SGRBG10_1X10/${W}x${H}]"
+    fi
+    set_pad "${REAR_MEDIA}" '"rockchip-csi2-dphy0":0[fmt:SGRBG10_1X10/'"${W}x${H}"']'
+    if ! set_pad "${REAR_MEDIA}" '"rockchip-csi2-dphy0":1[fmt:SGRBG10_1X10/'"${W}x${H}"']'; then
+        log "WARN: optional pad setup failed: rockchip-csi2-dphy0:1"
+    fi
+    set_pad "${REAR_MEDIA}" '"rockchip-mipi-csi2":0[fmt:SGRBG10_1X10/'"${W}x${H}"']'
+    if ! set_pad "${REAR_MEDIA}" '"rockchip-mipi-csi2":1[fmt:SGRBG10_1X10/'"${W}x${H}"']'; then
+        log "WARN: optional pad setup failed: rockchip-mipi-csi2:1"
+    fi
+fi
+
+if [ "${REAR_ISP_LINKED}" = "1" ]; then
+    echo ""
+    echo "=== Step 4: Force ISP sink/source formats via ioctl helper ==="
+    if [ -x /usr/local/bin/config_isp ]; then
+        /usr/local/bin/config_isp "${ISP_SUBDEV}" "${W}" "${H}"
+    else
+        log "ERROR: /usr/local/bin/config_isp not found"
+        exit 1
+    fi
+fi
+
+echo ""
+echo "=== Step 5: Apply rear sensor controls ==="
+if [ -e "${SENSOR_SUBDEV}" ]; then
+    REAR_EXPOSURE="${REAR_EXPOSURE:-2448}"
+    # 128 is often too dark on this rear module; use a practical default.
+    REAR_ANALOG_GAIN="${REAR_ANALOG_GAIN:-768}"
+    v4l2-ctl -d "${SENSOR_SUBDEV}" -c test_pattern=0 >/dev/null 2>&1 || true
+    v4l2-ctl -d "${SENSOR_SUBDEV}" -c exposure="${REAR_EXPOSURE}" >/dev/null 2>&1 || true
+    v4l2-ctl -d "${SENSOR_SUBDEV}" -c analogue_gain="${REAR_ANALOG_GAIN}" >/dev/null 2>&1 || true
+    log "Sensor controls applied: exposure=${REAR_EXPOSURE} analogue_gain=${REAR_ANALOG_GAIN}"
+else
+    log "WARN: sensor subdev missing (${SENSOR_SUBDEV}); skipping manual controls"
+fi
+
+if [ "${REAR_ISP_LINKED}" = "1" ]; then
+    echo ""
+    echo "=== Step 6: Start AWB/CPROC feeder ==="
+    if systemctl --user start rkisp1-awb.service 2>/dev/null; then
+        log "rkisp1-awb.service started"
+    else
+        log "WARN: rkisp1-awb.service failed; starting manual feeder"
+        /usr/local/bin/rkisp1-awb 512 256 256 640 >/tmp/rkisp1-awb-rear.log 2>&1 &
+        log "rkisp1-awb PID $! (log: /tmp/rkisp1-awb-rear.log)"
+    fi
+    sleep 0.7
+fi
+
+echo ""
+if [ "${REAR_ISP_LINKED}" = "1" ]; then
+    echo "=== Step 7: Capture 1 frame from ${ISP_VIDEO_DEV} ==="
+else
+    echo "=== Step 7: Capture 1 frame from rear raw node (/dev/video0) ==="
+fi
+TS="$(date +%Y%m%d_%H%M%S)"
+if [ "${REAR_ISP_LINKED}" = "1" ]; then
+    OUTFILE="/tmp/rear_isp_${TS}.raw"
+    v4l2-ctl -d "${ISP_VIDEO_DEV}" \
+        --set-fmt-video="width=${W},height=${H},pixelformat=NV12" \
+        --stream-mmap 3 --stream-skip 8 --stream-count 1 --stream-to "${OUTFILE}" 2>&1
+else
+    OUTFILE="/tmp/rear_raw_${TS}.raw"
+    v4l2-ctl -d /dev/video0 \
+        --set-fmt-video="width=${W},height=${H},pixelformat=BA10" \
+        --stream-mmap 3 --stream-skip 8 --stream-count 1 --stream-to "${OUTFILE}" 2>&1
+fi
+
+if [ -f "${OUTFILE}" ]; then
+    size="$(stat -c%s "${OUTFILE}" 2>/dev/null || echo 0)"
+    if [ "${REAR_ISP_LINKED}" = "1" ]; then
+        expected=$((W * H * 3 / 2))
+    else
+        expected=$((W * H * 2))
+    fi
+    echo ""
+    echo "Captured: ${OUTFILE} (${size} bytes)"
+    if [ "${REAR_ISP_LINKED}" = "1" ]; then
+        echo "Expected NV12 size: ${expected} bytes"
+    else
+        echo "Expected BA10-in-16bit size: ${expected} bytes (driver may pack differently)"
+    fi
+    echo "Analyze on host:"
+    echo "  scp chaos@192.168.2.109:${OUTFILE} ."
+    if [ "${REAR_ISP_LINKED}" = "1" ]; then
+        echo "  python3 tools/analyze_raw.py --w ${W} --h ${H} --fmt nv12 $(basename "${OUTFILE}")"
+    else
+        echo "  python3 tools/analyze_raw.py --w ${W} --h ${H} $(basename "${OUTFILE}")"
+    fi
+else
+    log "ERROR: capture file not created"
+    exit 1
+fi
+
+echo ""
+echo "=== ISP link state ==="
+media-ctl -d "${ISP_MEDIA}" --print-topology 2>/dev/null | \
+    grep -E '(rkcif-mipi-lvds|rkisp-isp-subdev.*0|ENABLED|DISABLED)' | head -12 || true

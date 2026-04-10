@@ -25,11 +25,81 @@ require_cmd() {
 
 require_cmd media-ctl
 
+run_user_systemctl() {
+    local action="$1"
+    local unit="$2"
+    local user uid
+
+    # Case 1: script is run as a regular user with an active user bus.
+    if systemctl --user "${action}" "${unit}" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    # Case 2: script is run as root (boot service) and we can target a user bus.
+    if [ "$(id -u)" -ne 0 ]; then
+        return 1
+    fi
+    user="${CAMERA_USER:-chaos}"
+    uid="$(id -u "${user}" 2>/dev/null || true)"
+    if [ -z "${uid}" ] || [ ! -S "/run/user/${uid}/bus" ]; then
+        return 1
+    fi
+
+    if command -v runuser >/dev/null 2>&1; then
+        runuser -u "${user}" -- env \
+            XDG_RUNTIME_DIR="/run/user/${uid}" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" \
+            systemctl --user "${action}" "${unit}" >/dev/null 2>&1
+        return $?
+    fi
+
+    if command -v sudo >/dev/null 2>&1; then
+        sudo -u "${user}" env \
+            XDG_RUNTIME_DIR="/run/user/${uid}" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" \
+            systemctl --user "${action}" "${unit}" >/dev/null 2>&1
+        return $?
+    fi
+
+    return 1
+}
+
+stop_user_camera_services() {
+    [ "${FRONT_STOP_USER_SERVICES:-1}" = "1" ] || return 0
+
+    local stopped=0
+    if run_user_systemctl stop rkcam-webcam.service; then
+        log "stopped user service: rkcam-webcam.service"
+        stopped=1
+    fi
+    if run_user_systemctl stop rkisp1-awb.service; then
+        log "stopped user service: rkisp1-awb.service"
+        stopped=1
+    fi
+    if [ "${stopped}" -eq 1 ]; then
+        sleep 0.3
+    fi
+}
+
+start_user_camera_services() {
+    [ "${FRONT_RESTART_USER_SERVICES:-1}" = "1" ] || return 0
+
+    # AWB first, then webcam bridge.
+    if run_user_systemctl start rkisp1-awb.service; then
+        log "started user service: rkisp1-awb.service"
+    fi
+    if run_user_systemctl start rkcam-webcam.service; then
+        log "started user service: rkcam-webcam.service"
+    fi
+}
+
 find_isp_media() {
     local dev
+    local topo
     for dev in /dev/media0 /dev/media1 /dev/media2; do
         [ -e "$dev" ] || continue
-        if media-ctl -d "$dev" -p 2>/dev/null | grep -q 'rkisp-isp-subdev'; then
+        topo="$(media-ctl -d "$dev" -p 2>/dev/null || true)"
+        if [[ "${topo}" == *"rkisp-isp-subdev"* ]]; then
             echo "$dev"
             return 0
         fi
@@ -52,43 +122,61 @@ log "ISP media controller: ${MEDIA_DEV}"
 
 set_link() {
     local spec="$1"
-    if ! media-ctl -d "${MEDIA_DEV}" --links "${spec}" >/dev/null 2>&1; then
-        log "ERROR: failed to apply media link: ${spec}"
-        return 1
-    fi
-    log "link ok: ${spec}"
+    local i
+    for i in $(seq 1 20); do
+        if media-ctl -d "${MEDIA_DEV}" --links "${spec}" >/dev/null 2>&1; then
+            log "link ok: ${spec}"
+            return 0
+        fi
+        sleep 0.2
+    done
+    log "ERROR: failed to apply media link after retries: ${spec}"
+    return 1
 }
 
 set_pad() {
     local spec="$1"
-    if ! media-ctl -d "${MEDIA_DEV}" --set-v4l2 "${spec}" >/dev/null 2>&1; then
-        log "ERROR: failed to apply pad format/crop: ${spec}"
-        return 1
-    fi
-    log "pad ok: ${spec}"
+    local i
+    for i in $(seq 1 20); do
+        if media-ctl -d "${MEDIA_DEV}" --set-v4l2 "${spec}" >/dev/null 2>&1; then
+            log "pad ok: ${spec}"
+            return 0
+        fi
+        sleep 0.2
+    done
+    log "ERROR: failed to apply pad format/crop after retries: ${spec}"
+    return 1
 }
 
 # 1) Select front camera link into ISP.
-set_link '"rkcif-mipi-lvds":0->"rkisp-isp-subdev":0[0]'
-set_link '"rkcif-mipi-lvds2":0->"rkisp-isp-subdev":0[1]'
+stop_user_camera_services
+
+if ! set_link '"rkcif-mipi-lvds":0 -> "rkisp-isp-subdev":0 [0]'; then
+    log "WARNING: could not disable rear ISP link (often busy if already switched)"
+fi
+if ! set_link '"rkcif-mipi-lvds2":0 -> "rkisp-isp-subdev":0 [1]'; then
+    log "WARNING: could not force-enable front ISP link; validating current topology"
+fi
 
 # 2) Pin front-camera dimensions/formats on input and ISP output.
 set_pad '"rkcif-mipi-lvds2":0[fmt:SGRBG10_1X10/2592x1944]'
 set_pad '"rkisp-isp-subdev":0[fmt:SGRBG10_1X10/2592x1944 crop:(0,0)/2592x1944]'
 set_pad '"rkisp-isp-subdev":2[fmt:YUYV8_2X8/2592x1944 crop:(0,0)/2592x1944]'
 
-if ! media-ctl -d "${MEDIA_DEV}" -p 2>/dev/null | \
-    grep -q '<- "rkcif-mipi-lvds2":0 \[ENABLED\]'; then
+MEDIA_TOPOLOGY="$(media-ctl -d "${MEDIA_DEV}" -p 2>/dev/null || true)"
+if [[ "${MEDIA_TOPOLOGY}" != *'<- "rkcif-mipi-lvds2":0 [ENABLED]'* ]]; then
     log "ERROR: front link was not enabled after setup"
     exit 1
 fi
 log "front link verified: rkcif-mipi-lvds2 -> rkisp-isp-subdev"
 
 # 3) Force ISP sink/source via ioctl helper (handles stale crop state on some boots).
-ISP_SUBDEV="$(media-ctl -d "${MEDIA_DEV}" -p 2>/dev/null \
-    | grep -A1 'rkisp-isp-subdev' \
-    | grep 'device node name' \
-    | awk '{print $NF}')"
+ISP_SUBDEV="$(media-ctl -d "${MEDIA_DEV}" -p 2>/dev/null | awk '
+    /^- entity [0-9]+: rkisp-isp-subdev / { in_entity = 1; next }
+    in_entity && /device node name/ { print $NF; found = 1; exit }
+    in_entity && /^- entity [0-9]+:/ { exit }
+    END { if (!found) print "" }
+')"
 
 if [ -z "${ISP_SUBDEV}" ]; then
     ISP_SUBDEV="/dev/v4l-subdev7"
@@ -98,9 +186,9 @@ else
 fi
 
 if [ -x /usr/local/bin/config_isp ]; then
-    /usr/local/bin/config_isp "${ISP_SUBDEV}" 2>&1 | while read -r line; do
-        log "$line"
-    done
+    if ! /usr/local/bin/config_isp "${ISP_SUBDEV}" 2>&1 | sed 's/^/[camera-isp-setup] /'; then
+        log "WARNING: config_isp failed, continuing with media-ctl state"
+    fi
 else
     log "WARNING: /usr/local/bin/config_isp not found — skipping ioctl crop reset"
 fi
@@ -120,5 +208,7 @@ if command -v v4l2-ctl >/dev/null 2>&1; then
         log "manual sensor controls skipped (FRONT_FORCE_MANUAL=${FRONT_FORCE_MANUAL:-1})"
     fi
 fi
+
+start_user_camera_services
 
 log "Front camera ISP pipeline ready. Use /dev/video23 for preview/webcam"

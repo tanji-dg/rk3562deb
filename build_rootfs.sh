@@ -269,6 +269,15 @@ if command -v flatpak >/dev/null 2>&1; then
     flatpak remote-add --if-not-exists flathub \
         https://flathub.org/repo/flathub.flatpakrepo || \
             echo "[!] Warning: failed to add Flathub remote."
+
+    # Install FreeTube from Flathub by default when the app is available.
+    freetube_ref="io.freetubeapp.FreeTube"
+    if flatpak remote-info --system flathub "${freetube_ref}" >/dev/null 2>&1; then
+        flatpak install --system -y --noninteractive flathub "${freetube_ref}" || \
+            echo "[!] Warning: FreeTube Flatpak install failed, skipping."
+    else
+        echo "[!] Warning: FreeTube Flatpak (${freetube_ref}) not available, skipping."
+    fi
 fi
 
 # Chromium is often smoother than Firefox on this board for YouTube playback.
@@ -1670,15 +1679,6 @@ PATH=/usr/local/bin:/usr/bin:/bin
 export DISPLAY="${DISPLAY:-:0}"
 export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-MODE="${1:-natural}"
-
-case "${MODE}" in
-    natural|boosted) ;;
-    *)
-        echo "Usage: $0 [natural|boosted]"
-        exit 2
-        ;;
-esac
 
 MEDIA_DEV=""
 for dev in /dev/media0 /dev/media1 /dev/media2; do
@@ -1725,51 +1725,55 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-if [ "${MODE}" = "boosted" ]; then
-    gst-launch-1.0 --no-fault \
-      v4l2src device=/dev/video23 io-mode=0 do-timestamp=true ! \
-      video/x-raw,format=UYVY,width=1280,height=720,framerate=15/1 ! \
-      videobalance brightness=0.25 contrast=1.6 ! \
-      videoconvert ! ximagesink sync=false
-else
-    gst-launch-1.0 --no-fault \
-      v4l2src device=/dev/video23 io-mode=0 do-timestamp=true ! \
-      video/x-raw,format=UYVY,width=1280,height=720,framerate=15/1 ! \
-      videoconvert ! ximagesink sync=false
-fi
+gst-launch-1.0 --no-fault \
+  v4l2src device=/dev/video23 io-mode=0 do-timestamp=true ! \
+  video/x-raw,format=UYVY,width=1280,height=720,framerate=15/1 ! \
+  videoconvert ! ximagesink sync=false
 FRONT_CAM_PREVIEW
 chmod +x "${ROOTFS_MNT}/home/chaos/.local/bin/front-camera-preview.sh"
 
-cat > "${ROOTFS_MNT}/home/chaos/.local/share/applications/front-camera-preview-natural.desktop" << 'FRONT_CAM_NATURAL_DESKTOP'
+cat > "${ROOTFS_MNT}/home/chaos/.local/share/applications/front-camera-preview.desktop" << 'FRONT_CAM_DESKTOP'
 [Desktop Entry]
 Type=Application
-Name=Front Camera Preview (Natural)
-Comment=Open a live front camera test window with natural colors
-Exec=/home/chaos/.local/bin/front-camera-preview.sh natural
+Name=Front Camera Preview
+Comment=Open a live front camera test window
+Exec=/home/chaos/.local/bin/front-camera-preview.sh
 Icon=camera-photo
 Categories=AudioVideo;Video;
 Terminal=false
 StartupNotify=true
-FRONT_CAM_NATURAL_DESKTOP
-
-cat > "${ROOTFS_MNT}/home/chaos/.local/share/applications/front-camera-preview-boosted.desktop" << 'FRONT_CAM_BOOSTED_DESKTOP'
-[Desktop Entry]
-Type=Application
-Name=Front Camera Preview (Boosted)
-Comment=Open a brighter higher-contrast front camera test window
-Exec=/home/chaos/.local/bin/front-camera-preview.sh boosted
-Icon=camera-photo
-Categories=AudioVideo;Video;
-Terminal=false
-StartupNotify=true
-FRONT_CAM_BOOSTED_DESKTOP
-
-rm -f "${ROOTFS_MNT}/home/chaos/.local/share/applications/front-camera-preview.desktop"
+FRONT_CAM_DESKTOP
+rm -f \
+    "${ROOTFS_MNT}/home/chaos/.local/share/applications/front-camera-preview-natural.desktop" \
+    "${ROOTFS_MNT}/home/chaos/.local/share/applications/front-camera-preview-boosted.desktop"
 
 chroot "${ROOTFS_MNT}" chown -R chaos:chaos \
     /home/chaos/.local/bin/front-camera-preview.sh \
-    /home/chaos/.local/share/applications/front-camera-preview-natural.desktop \
-    /home/chaos/.local/share/applications/front-camera-preview-boosted.desktop || true
+    /home/chaos/.local/share/applications/front-camera-preview.desktop || true
+
+# Install launcher-friendly rear camera preview app.
+if [ -f "${ROOT_DIR}/overlay/rkcam-rear-preview.sh" ] && \
+   [ -f "${ROOT_DIR}/overlay/rkcam-rear-preview.desktop" ]; then
+    echo "[*] Installing rear camera preview app..."
+    mkdir -p "${ROOTFS_MNT}/home/chaos/.local/bin" \
+             "${ROOTFS_MNT}/home/chaos/.local/share/applications" \
+             "${ROOTFS_MNT}/home/chaos/Desktop"
+
+    cp "${ROOT_DIR}/overlay/rkcam-rear-preview.sh" \
+       "${ROOTFS_MNT}/home/chaos/.local/bin/rkcam-rear-preview.sh"
+    chmod +x "${ROOTFS_MNT}/home/chaos/.local/bin/rkcam-rear-preview.sh"
+
+    cp "${ROOT_DIR}/overlay/rkcam-rear-preview.desktop" \
+       "${ROOTFS_MNT}/home/chaos/.local/share/applications/rkcam-rear-preview.desktop"
+    cp "${ROOT_DIR}/overlay/rkcam-rear-preview.desktop" \
+       "${ROOTFS_MNT}/home/chaos/Desktop/Rear-Camera-Preview.desktop"
+    chmod +x "${ROOTFS_MNT}/home/chaos/Desktop/Rear-Camera-Preview.desktop"
+
+    chroot "${ROOTFS_MNT}" chown -R chaos:chaos \
+        /home/chaos/.local/bin/rkcam-rear-preview.sh \
+        /home/chaos/.local/share/applications/rkcam-rear-preview.desktop \
+        /home/chaos/Desktop/Rear-Camera-Preview.desktop || true
+fi
 
 # Force RK817 into a stable capture profile after PipeWire is ready.
 echo "[*] Installing RK817 pro-audio profile helper..."
@@ -2678,6 +2682,12 @@ if [ -f "${ROOT_DIR}/overlay/camera-isp-setup.sh" ] && \
     chmod +x "${ROOTFS_MNT}/usr/local/bin/camera-isp-setup.sh"
     cp "${ROOT_DIR}/overlay/camera-isp-setup.service" "${ROOTFS_MNT}/etc/systemd/system/camera-isp-setup.service"
     chroot "${ROOTFS_MNT}" systemctl enable camera-isp-setup.service
+fi
+
+if [ -f "${ROOT_DIR}/tools/setup_isp_rear.sh" ]; then
+    echo "[*] Installing rear camera ISP setup helper..."
+    cp "${ROOT_DIR}/tools/setup_isp_rear.sh" "${ROOTFS_MNT}/usr/local/bin/setup_isp_rear.sh"
+    chmod +x "${ROOTFS_MNT}/usr/local/bin/setup_isp_rear.sh"
 fi
 
 # 10b-awb. ISP AWB gain feeder (rkisp1-awb) — provides color to s5k5e8 front camera
