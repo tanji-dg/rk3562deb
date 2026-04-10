@@ -42,7 +42,7 @@ The resulting image is written to an SD card. Insert it and power on — the tab
 | **3D Acceleration** | ⚠️ Partial (Panfrost, OpenGL ES works) |
 | **NPU (RKLLM / rknn-llm)** | ✅ Active (RK3562 supports one NPU core, `num_npu_core=1`) |
 | **Accelerometer** | ✅ Full (SC7A20 / DA223) |
-| **Cameras** | ⚠️ WIP (front camera partially working) |
+| **Cameras** | ⚠️ Partial (front + rear pipelines functional; color tuning still needs calibration) |
 | **Battery / Charging** | ✅ Full (RK817 PMIC) |
 | **SD card boot** | ✅ Full |
 | **USB OTG** | ✅ Full |
@@ -53,6 +53,7 @@ The resulting image is written to an SD card. Insert it and power on — the tab
 |-----|-------|
 | **Firefox ESR** | Preinstalled web browser |
 | **Chromium** | Preinstalled web browser (installed when available on mirror) |
+| **FreeTube** | Installed via Flatpak from Flathub (when available) |
 | **Drawing** | Touch-friendly paint app (installed when available on mirror) |
 | **Snapshot** | Camera app (installed when available on mirror) |
 | **Dolphin** | File manager |
@@ -126,6 +127,7 @@ Result: `Qwen3-0.6B` is significantly faster on this RK3562 tablet for local NPU
 - Battery may report `0%` after the tablet has been powered off for a couple of hours.
 - `rk-battery-gauge-fix.service` fixes this on boot.
 - If the tablet did not fully power off, reboot once; on the next boot the battery level should be corrected.
+- Front and rear camera preview/capture are functional, but colors are still slightly off and require additional ISP calibration.
 
 ---
 
