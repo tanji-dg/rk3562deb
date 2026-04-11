@@ -1060,6 +1060,43 @@ echo "[*] Disabling Phosh GResource UI overrides..."
 rm -f "${ROOTFS_MNT}/etc/profile.d/90-phosh-resource-overrides.sh"
 rm -rf "${ROOTFS_MNT}/etc/phosh/resource-overrides/sm/puri/phosh"
 
+# Phosh 0.24 on this panel can require two fingers to pull the top menu in
+# landscape when top-panel drag mode is constrained to HANDLE. Patch the two
+# hardcoded call sites to FULL so one-finger top-edge drag works consistently.
+echo "[*] Patching Phosh top-panel drag mode for landscape swipe..."
+PHOSH_BIN="${ROOTFS_MNT}/usr/libexec/phosh"
+if [ -f "${PHOSH_BIN}" ]; then
+    patch_aarch64_word() {
+        local file="$1"
+        local offset="$2"
+        local expected_hex="$3"
+        local patched_hex="$4"
+        local label="$5"
+        local current_hex payload
+
+        current_hex="$(od -An -tx1 -N4 -j "${offset}" "${file}" | tr -d ' \n')"
+        if [ "${current_hex}" = "${patched_hex}" ]; then
+            echo "    - ${label}: already patched"
+            return 0
+        fi
+        if [ "${current_hex}" != "${expected_hex}" ]; then
+            echo "[!] Warning: ${label} unexpected bytes ${current_hex} (expected ${expected_hex}); skipping patch."
+            return 1
+        fi
+
+        payload="$(printf '%s' "${patched_hex}" | sed 's/../\\x&/g')"
+        printf '%b' "${payload}" | dd of="${file}" bs=1 seek="${offset}" conv=notrunc status=none
+        echo "    - ${label}: patched"
+        return 0
+    }
+
+    patch_aarch64_word "${PHOSH_BIN}" "$((0x0a7aa0))" "37008052" "17008052" "top-panel drag mode"
+    patch_aarch64_word "${PHOSH_BIN}" "$((0x0b7978))" "21008052" "01008052" "osk drag mode"
+    unset -f patch_aarch64_word
+else
+    echo "[!] Warning: ${PHOSH_BIN} not found; drag-mode patch skipped."
+fi
+
 # 8. Setting hostname and fstab
 echo "[*] Setting hostname and fstab..."
 echo "rk3562-debian" > "${ROOTFS_MNT}/etc/hostname"
@@ -1157,6 +1194,15 @@ POLL_INTERVAL="${POLL_INTERVAL:-0.25}"
 # X-axis sign mapping for landscape; tuned for this panel.
 X_POS_TRANSFORM="${X_POS_TRANSFORM:-90}"
 X_NEG_TRANSFORM="${X_NEG_TRANSFORM:-270}"
+STARTUP_SETTLE_SEC="${STARTUP_SETTLE_SEC:-2}"
+LANDSCAPE_PRIME_ON_STARTUP="${LANDSCAPE_PRIME_ON_STARTUP:-1}"
+LANDSCAPE_PRIME_DELAY="${LANDSCAPE_PRIME_DELAY:-0.20}"
+RESYNC_POLLS="${RESYNC_POLLS:-20}"
+DISPLAYCONFIG_ENABLED="${DISPLAYCONFIG_ENABLED:-1}"
+DISPLAYCONFIG_DEST="${DISPLAYCONFIG_DEST:-sm.puri.Phosh.Portal}"
+DISPLAYCONFIG_PATH="${DISPLAYCONFIG_PATH:-/org/gnome/Mutter/DisplayConfig}"
+DISPLAYCONFIG_IFACE="${DISPLAYCONFIG_IFACE:-org.gnome.Mutter.DisplayConfig}"
+use_displayconfig=0
 
 log() {
   printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG_FILE"
@@ -1175,6 +1221,75 @@ orientation_locked() {
   local v
   v="$(gsettings get org.gnome.settings-daemon.peripherals.touchscreen orientation-lock 2>/dev/null || echo false)"
   [[ "$v" == "true" ]]
+}
+
+can_use_displayconfig() {
+  [[ "$DISPLAYCONFIG_ENABLED" != "0" ]] || return 1
+  command -v busctl >/dev/null 2>&1 || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  busctl --user --json=short call \
+    "$DISPLAYCONFIG_DEST" "$DISPLAYCONFIG_PATH" "$DISPLAYCONFIG_IFACE" \
+    GetCurrentState >/dev/null 2>&1
+}
+
+transform_to_rotation() {
+  case "$1" in
+    normal|0) echo "0" ;;
+    90) echo "1" ;;
+    180) echo "2" ;;
+    270) echo "3" ;;
+    *) return 1 ;;
+  esac
+}
+
+rotation_to_transform() {
+  case "$1" in
+    0) echo "normal" ;;
+    1) echo "90" ;;
+    2) echo "180" ;;
+    3) echo "270" ;;
+    *) return 1 ;;
+  esac
+}
+
+displayconfig_state_json() {
+  busctl --user --json=short call \
+    "$DISPLAYCONFIG_DEST" "$DISPLAYCONFIG_PATH" "$DISPLAYCONFIG_IFACE" \
+    GetCurrentState 2>/dev/null
+}
+
+current_transform_displayconfig() {
+  local state rot
+  state="$(displayconfig_state_json)" || return 1
+  rot="$(echo "$state" | jq -r '.data[2][0][3] // empty')"
+  [[ -n "$rot" ]] || return 1
+  rotation_to_transform "$rot"
+}
+
+apply_transform_displayconfig() {
+  local transform="$1"
+  local rotation state serial connector mode x y scale primary
+
+  rotation="$(transform_to_rotation "$transform")" || return 1
+  state="$(displayconfig_state_json)" || return 1
+
+  serial="$(echo "$state" | jq -r '.data[0] // empty')"
+  connector="$(echo "$state" | jq -r '.data[1][0][0][0] // empty')"
+  mode="$(echo "$state" | jq -r '.data[1][0][1] | map(select((.[6]["is-current"].data // false) == true))[0][0] // empty')"
+  x="$(echo "$state" | jq -r '.data[2][0][0] // empty')"
+  y="$(echo "$state" | jq -r '.data[2][0][1] // empty')"
+  scale="$(echo "$state" | jq -r '.data[2][0][2] // empty')"
+  primary="$(echo "$state" | jq -r '.data[2][0][4] // empty')"
+
+  [[ -n "$serial" && -n "$connector" && -n "$mode" && -n "$x" && -n "$y" && -n "$scale" && -n "$primary" ]] || return 1
+
+  busctl --user call \
+    "$DISPLAYCONFIG_DEST" "$DISPLAYCONFIG_PATH" "$DISPLAYCONFIG_IFACE" \
+    ApplyMonitorsConfig "uua(iiduba(ssa{sv}))a{sv}" \
+    "$serial" 2 \
+    1 "$x" "$y" "$scale" "$rotation" "$primary" \
+    1 "$connector" "$mode" 0 \
+    0 >/dev/null 2>&1
 }
 
 detect_wayland_display() {
@@ -1197,6 +1312,10 @@ detect_wayland_display() {
 }
 
 current_transform() {
+  if (( use_displayconfig )); then
+    current_transform_displayconfig || true
+    return 0
+  fi
   wlr-randr 2>/dev/null | awk '/Transform:/ {print $2; exit}' || true
 }
 
@@ -1217,9 +1336,35 @@ apply_transform() {
     return 0
   fi
 
+  local current
+  current="$(current_transform)"
+  if [[ -n "$current" && "$current" == "$transform" ]]; then
+    printf '%s' "$transform" > "$STATE_FILE"
+    return 0
+  fi
+
+  # First landscape apply after login can race shell init in wlr-randr mode.
+  if (( !use_displayconfig )) && [[ "${LANDSCAPE_PRIME_ON_STARTUP}" != "0" &&
+        "$startup_prime_done" == "0" &&
+        ( "$transform" == "90" || "$transform" == "270" ) ]]; then
+    wlr-randr --output "$OUTPUT_NAME" --transform normal >/dev/null 2>&1 || true
+    sleep "$LANDSCAPE_PRIME_DELAY"
+    startup_prime_done=1
+  fi
+
+  if (( use_displayconfig )); then
+    if apply_transform_displayconfig "$transform"; then
+      printf '%s' "$transform" > "$STATE_FILE"
+      log "applied transform=$transform backend=displayconfig"
+      return 0
+    fi
+    log "displayconfig apply failed transform=$transform"
+    return 0
+  fi
+
   if wlr-randr --output "$OUTPUT_NAME" --transform "$transform" >/dev/null 2>&1; then
     printf '%s' "$transform" > "$STATE_FILE"
-    log "applied transform=$transform"
+    log "applied transform=$transform backend=wlr-randr"
   else
     log "failed transform=$transform output=$OUTPUT_NAME"
   fi
@@ -1277,15 +1422,35 @@ if [[ ! -r "$AXIS_FILE" ]]; then
   exit 1
 fi
 
+if can_use_displayconfig; then
+  use_displayconfig=1
+  log "rotation backend=displayconfig"
+else
+  log "rotation backend=wlr-randr"
+fi
+
 # Seed state from compositor so we do not force-rotate on startup.
 printf '%s' "$(current_transform)" > "$STATE_FILE" 2>/dev/null || true
 log "starting raw-axis autorotate output=$OUTPUT_NAME wayland=$WAYLAND_DISPLAY axis=$AXIS_FILE"
+if [[ "${STARTUP_SETTLE_SEC}" != "0" ]]; then
+  sleep "$STARTUP_SETTLE_SEC"
+fi
 
 pending=""
 pending_count=0
 last_lock_state=""
+startup_prime_done=0
+loop_count=0
 
 while true; do
+  loop_count=$((loop_count + 1))
+  if (( RESYNC_POLLS > 0 )) && (( loop_count % RESYNC_POLLS == 0 )); then
+    current="$(current_transform)"
+    if [[ -n "$current" ]]; then
+      printf '%s' "$current" > "$STATE_FILE" 2>/dev/null || true
+    fi
+  fi
+
   lock_state="$(gsettings get org.gnome.settings-daemon.peripherals.touchscreen orientation-lock 2>/dev/null || echo false)"
   if [[ "$lock_state" != "$last_lock_state" ]]; then
     log "orientation-lock=$lock_state"
