@@ -2,7 +2,7 @@
 # setup_isp_rear.sh — configure rear camera (s5k4h5yb) through ISP.
 #
 # Route: s5k4h5yb -> DPHY0 -> MIPI CSI2 -> rkcif-mipi-lvds -> rkisp -> /dev/video22
-# Default mode is 2592x1944 for wider FOV than 1080p center crop.
+# Default mode is 1920x1080 (stable on current BSP).
 #
 # Key fix:
 #   We must set the rear CIF pad format on the ISP media graph
@@ -13,7 +13,7 @@
 #   bash setup_isp_rear.sh
 #
 # Optional env:
-#   REAR_W=2592 REAR_H=1944
+#   REAR_W=1920 REAR_H=1080
 #   ISP_VIDEO_DEV=/dev/video22
 #   REAR_SENSOR_SUBDEV=/dev/v4l-subdev2
 #   REAR_FOCUS_SUBDEV=/dev/v4l-subdev3
@@ -21,8 +21,8 @@
 #   REAR_SENSOR_ENTITY="m00_b_s5k4h5yb 4-0036"
 set -euo pipefail
 
-W="${REAR_W:-2592}"
-H="${REAR_H:-1944}"
+W="${REAR_W:-1920}"
+H="${REAR_H:-1080}"
 ISP_VIDEO_DEV="${ISP_VIDEO_DEV:-/dev/video22}"
 ISP_SUBDEV="${ISP_SUBDEV:-/dev/v4l-subdev7}"
 SENSOR_SUBDEV="${REAR_SENSOR_SUBDEV:-/dev/v4l-subdev2}"

@@ -4,9 +4,10 @@ set -euo pipefail
 REAR_SETUP="${REAR_SETUP:-/usr/local/bin/setup_isp_rear.sh}"
 FRONT_SETUP="${FRONT_SETUP:-/usr/local/bin/camera-isp-setup.sh}"
 DEVICE="${REAR_PREVIEW_DEVICE:-/dev/video22}"
-# Use a wider default than 1080p crop.
-W="${REAR_PREVIEW_W:-2592}"
-H="${REAR_PREVIEW_H:-1944}"
+# Default to stable rear mode. Wider modes can currently blow out on this BSP.
+W="${REAR_PREVIEW_W:-1920}"
+H="${REAR_PREVIEW_H:-1080}"
+FPS="${REAR_PREVIEW_FPS:-15}"
 SETUP_W="${REAR_SETUP_W:-$W}"
 SETUP_H="${REAR_SETUP_H:-$H}"
 FOCUS="${REAR_PREVIEW_FOCUS:-64}"
@@ -100,18 +101,19 @@ run_gst() {
     log "backend=gstreamer sink=${sink}"
     gst-launch-1.0 --no-fault -q \
       v4l2src device="${DEVICE}" io-mode=0 do-timestamp=true ! \
-      video/x-raw,format=NV12,width=${W},height=${H},framerate=30/1 ! \
+      video/x-raw,format=NV12,width=${W},height=${H},framerate=${FPS}/1 ! \
       queue max-size-buffers=4 leaky=downstream ! \
       videoconvert ! "${sink}" sync=false
 }
 
-log "Opening rear camera preview from ${DEVICE} (${W}x${H})"
+log "Opening rear camera preview from ${DEVICE} (${W}x${H}@${FPS}fps)"
 notify_user "Rear Camera Preview" "Rear preview started"
 
-if [ -n "${WAYLAND_DISPLAY:-}" ] && gst-inspect-1.0 waylandsink >/dev/null 2>&1; then
-    run_gst waylandsink
-elif [ -n "${DISPLAY:-}" ] && gst-inspect-1.0 ximagesink >/dev/null 2>&1; then
+# Prefer Xwayland sink first; waylandsink has been unstable on this BSP/Phosh stack.
+if [ -n "${DISPLAY:-}" ] && gst-inspect-1.0 ximagesink >/dev/null 2>&1; then
     run_gst ximagesink
+elif [ -n "${WAYLAND_DISPLAY:-}" ] && gst-inspect-1.0 waylandsink >/dev/null 2>&1; then
+    run_gst waylandsink
 else
     run_gst autovideosink
 fi
