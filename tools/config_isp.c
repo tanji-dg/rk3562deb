@@ -1,13 +1,17 @@
-/* config_isp.c — force ISP subdev format + crop for front camera 2592x1944.
- * Sets pad0 (Sink) and pad2 (Source) on the rkisp-isp-subdev node.
+/* config_isp.c — force ISP subdev format + crop on rkisp-isp-subdev.
+ * Sets pad0 (Sink, Bayer input) and pad2 (Source, YUV output).
  *
- * Usage: config_isp [/dev/v4l-subdevN]   (default: /dev/v4l-subdev7)
+ * Usage: config_isp [/dev/v4l-subdevN [WIDTH HEIGHT]]
+ *   Default path:       /dev/v4l-subdev7
+ *   Default resolution: 2592x1944 (front camera)
+ *   Example (rear 1080p): config_isp /dev/v4l-subdev7 1920 1080
  *
  * Needed because media-ctl --set-v4l2 returns EINVAL for this driver when
- * the ISP crop registers are stale from a prior rear-camera configuration.
+ * the ISP crop registers are stale from a prior camera configuration.
  */
 #include <errno.h>
 #include <fcntl.h>
+#include <stdlib.h>
 #include <linux/media.h>
 #include <linux/v4l2-mediabus.h>
 #include <linux/v4l2-subdev.h>
@@ -17,13 +21,13 @@
 #include <unistd.h>
 
 #define ISP_SUBDEV  "/dev/v4l-subdev7"
-#define W 2592
-#define H 1944
+#define W_DEFAULT 2592
+#define H_DEFAULT 1944
 
-/* MEDIA_BUS_FMT_SGRBG10_1X10 = 0x300f */
-#define SGRBG10_1X10 0x300f
-/* MEDIA_BUS_FMT_YUYV8_2X8 = 0x2011 */
-#define YUYV8_2X8    0x2011
+/* MEDIA_BUS_FMT_SGRBG10_1X10 = 0x300a (verified against kernel headers) */
+#define SGRBG10_1X10 0x300a
+/* MEDIA_BUS_FMT_YUYV8_2X8 = 0x2008 (verified against kernel headers) */
+#define YUYV8_2X8    0x2008
 
 static int xioctl(int fd, unsigned long req, void *arg)
 {
@@ -75,16 +79,24 @@ static int set_pad_crop(int fd, unsigned int pad, int x, int y, int w, int h)
 int main(int argc, char **argv)
 {
 	const char *path = argc > 1 ? argv[1] : ISP_SUBDEV;
+	int w = argc > 3 ? atoi(argv[2]) : W_DEFAULT;
+	int h = argc > 3 ? atoi(argv[3]) : H_DEFAULT;
+
+	if (w <= 0 || h <= 0) {
+		fprintf(stderr, "Usage: %s [/dev/v4l-subdevN [WIDTH HEIGHT]]\n", argv[0]);
+		return 1;
+	}
+
 	int fd = open(path, O_RDWR);
 	if (fd < 0) { perror(path); return 1; }
 
-	printf("=== ISP pad0 (Sink) — raw Bayer input ===\n");
-	set_pad_fmt(fd, 0, SGRBG10_1X10, W, H);
-	set_pad_crop(fd, 0, 0, 0, W, H);
+	printf("=== ISP pad0 (Sink) — raw Bayer input %dx%d ===\n", w, h);
+	set_pad_fmt(fd, 0, SGRBG10_1X10, w, h);
+	set_pad_crop(fd, 0, 0, 0, w, h);
 
-	printf("=== ISP pad2 (Source) — processed output ===\n");
-	set_pad_fmt(fd, 2, YUYV8_2X8, W, H);
-	set_pad_crop(fd, 2, 0, 0, W, H);
+	printf("=== ISP pad2 (Source) — processed output %dx%d ===\n", w, h);
+	set_pad_fmt(fd, 2, YUYV8_2X8, w, h);
+	set_pad_crop(fd, 2, 0, 0, w, h);
 
 	close(fd);
 	return 0;
