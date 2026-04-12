@@ -430,6 +430,7 @@ rkdebian/
 │   ├── include/          # Build-time kernel header overrides
 │   ├── kernel-patches/   # Kernel patches applied during build
 │   ├── etc/              # On-device config overrides (logind, etc.)
+│   ├── mali-shim.c       # Mali GPU userspace shim (compiled during build)
 │   └── *.sh / *.service  # On-device setup scripts and systemd units
 ├── debs/                 # Pre-built .deb packages (Mali GPU, Rockchip MPP)
 ├── mali/                 # Mali GPU userspace library (.so)
