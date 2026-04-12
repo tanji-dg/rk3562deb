@@ -3,7 +3,7 @@
  * Usage: capture_rear [output.raw]
  * Defaults to /tmp/rear.raw.
  *
- * The rear camera outputs SGRBG10 (GB10) Bayer at 3264x2448.
+ * The rear camera outputs SGRBG10 (BA10) Bayer at 3264x2448.
  * Analyze with: python3 tools/analyze_raw.py --w 3264 --h 2448 <file>
  */
 #include <errno.h>
@@ -19,7 +19,7 @@
 #define DEV    "/dev/video0"
 #define WIDTH  3264
 #define HEIGHT 2448
-#define PIXFMT V4L2_PIX_FMT_SGRBG10  /* GB10 */
+#define PIXFMT V4L2_PIX_FMT_SGRBG10  /* BA10 */
 #define BPP    2
 
 static int xioctl(int fd, unsigned long req, void *arg)
