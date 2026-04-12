@@ -423,12 +423,14 @@ rkdebian/
 ├── genimage.cfg          # SD card image partition layout
 ├── extlinux.conf         # Bootloader config (kernel + DTB)
 ├── splash.png            # Boot splash screen
-├── overlay/              # Custom kernel drivers, DTS, firmware, and services
+├── overlay/              # Custom kernel drivers, DTS, firmware, services, and headers
 │   ├── arch/             # Device tree sources (DTS/DTSI)
 │   ├── drivers/          # Out-of-tree kernel drivers (Wi-Fi EA6621Q, cameras, PMIC)
 │   ├── firmware/         # Wi-Fi firmware blobs (Seekwave EA6621Q)
+│   ├── include/          # Build-time kernel header overrides
 │   ├── kernel-patches/   # Kernel patches applied during build
-│   └── etc/              # On-device config overrides (logind, etc.)
+│   ├── etc/              # On-device config overrides (logind, etc.)
+│   └── *.sh / *.service  # On-device setup scripts and systemd units
 ├── debs/                 # Pre-built .deb packages (Mali GPU, Rockchip MPP)
 ├── mali/                 # Mali GPU userspace library (.so)
 ├── wifi/                 # Wi-Fi firmware, vendor SDK, and porting guides
