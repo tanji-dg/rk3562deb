@@ -425,6 +425,33 @@ rkdebian/
 
 ---
 
+## Attribution
+
+Third-party components included in this repository:
+
+### Mali GPU binaries
+
+The prebuilt Mali GPU packages in `debs/` and the userspace library in `mali/` are sourced from:
+
+- [christianhaitian/rk3566_core_builds](https://github.com/christianhaitian/rk3566_core_builds/tree/master/mali/aarch64)
+- [tsukumijima/libmali-rockchip](https://github.com/tsukumijima/libmali-rockchip/releases)
+
+These binaries are provided by those projects under their respective terms. ARM Mali firmware and userspace libraries are proprietary ARM IP.
+
+### Rockchip MPP (Media Process Platform)
+
+The Rockchip MPP packages in `debs/` (`librockchip-mpp1`, `librockchip-mpp-dev`, `librockchip-vpu0`) are sourced from:
+
+- [christianhaitian/rk3566_core_builds](https://github.com/christianhaitian/rk3566_core_builds/tree/master/mali/aarch64)
+
+Rockchip MPP is licensed under the Apache 2.0 License.
+
+### Seekwave Wi-Fi / Bluetooth
+
+The Wi-Fi and Bluetooth driver source in `overlay/drivers/net/wireless/ea6621q/` and firmware blobs in `overlay/firmware/` and `wifi/` are provided by **Seekwave Technology Co. Ltd** (重庆希微科技有限公司). The driver is open-sourced by the vendor.
+
+---
+
 ## License
 
 **MIT License — © 2026 tech4bot**
