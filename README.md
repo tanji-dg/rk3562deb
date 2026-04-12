@@ -42,7 +42,7 @@ The resulting image is written to an SD card. Insert it and power on — the tab
 | **3D Acceleration** | ⚠️ Partial (Panfrost, OpenGL ES works) |
 | **NPU (RKLLM / rknn-llm)** | ✅ Active (RK3562 supports one NPU core, `num_npu_core=1`) |
 | **Accelerometer** | ✅ Full (SC7A20 / DA223) |
-| **Flashlight / Lantern (rear LED)** | ✅ Full (native Phosh top-menu torch toggle + brightness control via `rk-flashlightctl`) |
+| **Flashlight (rear LED)** | ✅ Full (native Phosh top-menu torch toggle + brightness control via `rk-flashlightctl`) |
 | **Power button behavior** | ✅ Full (short press sleeps on release, long press >=3s opens shutdown dialog) |
 | **Lockscreen orientation memory** | ✅ Full (lock screen keeps last tablet orientation, including landscape) |
 | **Cameras** | ⚠️ Partial (front `s5k5e8` + rear `s5k4h5yb` pipelines functional; color tuning still needs calibration) |
@@ -301,8 +301,7 @@ Tune mapping on-device in `/etc/default/rk-power-profile-map`.
 
 ### Phosh UX Integrations
 
-- Rear camera flashlight is exposed as LED `camera:flash`, so Phosh shows the native top-menu torch icon (used as lantern toggle).
-- Legacy Lantern desktop app has been removed in favor of native Phosh torch integration.
+- Rear camera flashlight is exposed as LED `camera:flash`, so Phosh shows the native top-menu torch icon.
 - `rk-flashlightctl` supports both toggle and intensity control (`set 0..100`) for the rear LED.
 - `rk-powerkey-longpress.service` owns hardware power-key policy:
   - short press (`<3s`) -> suspend on key release
