@@ -56,7 +56,7 @@ The resulting image is written to an SD card. Insert it and power on — the tab
 |-----|-------|
 | **Firefox ESR** | Preinstalled web browser |
 | **Chromium** | Preinstalled web browser (installed when available on mirror) |
-| **FreeTube** | Optional Flatpak app (disabled by default; enable with `RKDEBIAN_PREINSTALL_FREETUBE=1`) |
+| **FreeTube** | Installed via Flatpak from Flathub by default (disable with `RKDEBIAN_PREINSTALL_FREETUBE=0` for smaller images) |
 | **Drawing** | Touch-friendly paint app (installed when available on mirror) |
 | **Snapshot** | Camera app (installed when available on mirror) |
 | **Dolphin** | File manager |
@@ -235,7 +235,7 @@ These variables can be set before running `build.sh` to control build behaviour:
 | `RKDEBIAN_GPU_STACK` | `mali` | GPU stack to build for: `mali` (vendor userspace) or `panfrost` (Mesa/Panfrost, no `libmali`). |
 | `RKDEBIAN_CPU_GOVERNOR` | `performance` | Baseline CPU governor used at boot and as the default mapping for Phosh `balanced` mode. |
 | `RKDEBIAN_MALI_GBM_PROVIDER` | `vendor` | Mali-only option: `vendor` keeps `mali/libgbm.so.1` from the blob package (default), `debian` overrides it to Debian `libgbm.so.1` for compatibility testing. |
-| `RKDEBIAN_PREINSTALL_FREETUBE` | `0` | Set to `1` to preinstall FreeTube from Flathub in the image. Keeping `0` significantly reduces image size. |
+| `RKDEBIAN_PREINSTALL_FREETUBE` | `1` | Set to `0` to skip FreeTube preinstall and significantly reduce image size. |
 | `RKDEBIAN_MINIMIZE_IMAGE` | `0` | Set to `1` for aggressive size reduction (prunes non-English locales plus `/usr/share/doc`, `/usr/share/help`, `/usr/share/man`, `/usr/share/info`, and unused Flatpak objects). |
 
 ### Kernel
@@ -288,9 +288,9 @@ RKDEBIAN_CPU_GOVERNOR=schedutil ./build.sh all
 RKDEBIAN_MALI_GBM_PROVIDER=debian ./build.sh all --ui-session=phosh --gpu-stack=mali --force-clean-rootfs
 
 # Size-focused build for easier GitHub uploads
-RKDEBIAN_FORCE_CLEAN_ROOTFS=1 RKDEBIAN_MINIMIZE_IMAGE=1 ./build.sh all
+RKDEBIAN_FORCE_CLEAN_ROOTFS=1 RKDEBIAN_MINIMIZE_IMAGE=1 RKDEBIAN_PREINSTALL_FREETUBE=0 ./build.sh all
 
-# Same, but with FreeTube preinstalled
+# Size-focused build while keeping default FreeTube preinstall enabled
 RKDEBIAN_FORCE_CLEAN_ROOTFS=1 RKDEBIAN_MINIMIZE_IMAGE=1 RKDEBIAN_PREINSTALL_FREETUBE=1 ./build.sh all
 ```
 
