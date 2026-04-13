@@ -1242,13 +1242,15 @@ STARTUP_SETTLE_SEC="${STARTUP_SETTLE_SEC:-2}"
 LANDSCAPE_PRIME_ON_STARTUP="${LANDSCAPE_PRIME_ON_STARTUP:-1}"
 LANDSCAPE_PRIME_DELAY="${LANDSCAPE_PRIME_DELAY:-0.20}"
 RESYNC_POLLS="${RESYNC_POLLS:-20}"
-# D-Bus DisplayConfig can intermittently fail on this tablet/Phosh combo.
-# Keep wlr-randr as default, while allowing opt-in via env.
-DISPLAYCONFIG_ENABLED="${DISPLAYCONFIG_ENABLED:-0}"
+# Prefer Phosh's DisplayConfig API so shell components relayout in sync
+# during rotation. If it glitches, we fail over to wlr-randr and retry.
+DISPLAYCONFIG_ENABLED="${DISPLAYCONFIG_ENABLED:-1}"
 DISPLAYCONFIG_DEST="${DISPLAYCONFIG_DEST:-sm.puri.Phosh.Portal}"
 DISPLAYCONFIG_PATH="${DISPLAYCONFIG_PATH:-/org/gnome/Mutter/DisplayConfig}"
 DISPLAYCONFIG_IFACE="${DISPLAYCONFIG_IFACE:-org.gnome.Mutter.DisplayConfig}"
+DISPLAYCONFIG_RETRY_POLLS="${DISPLAYCONFIG_RETRY_POLLS:-24}"
 use_displayconfig=0
+displayconfig_retry_count=0
 
 log() {
   printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG_FILE"
@@ -1424,6 +1426,9 @@ apply_transform() {
     # DisplayConfig state can be transiently invalid on lock/wake;
     # fail over so rotation never gets stuck.
     use_displayconfig=0
+    if (( DISPLAYCONFIG_RETRY_POLLS > 0 )); then
+      displayconfig_retry_count="$DISPLAYCONFIG_RETRY_POLLS"
+    fi
     log "displayconfig apply failed transform=$transform; falling back to wlr-randr"
   fi
 
@@ -1491,6 +1496,9 @@ if can_use_displayconfig; then
   use_displayconfig=1
   log "rotation backend=displayconfig"
 else
+  if (( DISPLAYCONFIG_RETRY_POLLS > 0 )); then
+    displayconfig_retry_count="$DISPLAYCONFIG_RETRY_POLLS"
+  fi
   log "rotation backend=wlr-randr"
 fi
 
@@ -1513,6 +1521,17 @@ loop_count=0
 
 while true; do
   loop_count=$((loop_count + 1))
+
+  if (( !use_displayconfig )) && (( DISPLAYCONFIG_RETRY_POLLS > 0 )); then
+    if (( displayconfig_retry_count > 0 )); then
+      displayconfig_retry_count=$((displayconfig_retry_count - 1))
+    fi
+    if (( displayconfig_retry_count == 0 )) && can_use_displayconfig; then
+      use_displayconfig=1
+      log "rotation backend=displayconfig (recovered)"
+    fi
+  fi
+
   if (( LOCKSCREEN_POLL_DIV <= 1 )) || (( loop_count % LOCKSCREEN_POLL_DIV == 0 )); then
     if lockscreen_active; then
       lockscreen_state="true"
