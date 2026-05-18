@@ -181,6 +181,9 @@ esac
 
 verify_rootfs_profile() {
     local profile_file="${OUT_DIR}/rootfs/etc/rkdebian-build-profile"
+    local usr_owner
+    local pkexec_owner pkexec_mode
+    local polkit_helper_owner polkit_helper_mode
     if [ ! -f "${profile_file}" ]; then
         echo "[-] Error: missing ${profile_file}; refusing to package an unverified rootfs."
         exit 1
@@ -200,6 +203,43 @@ verify_rootfs_profile() {
 
     if [ ! -f "${OUT_DIR}/rootfs/usr/share/wayland-sessions/phosh.desktop" ]; then
         echo "[-] Error: phosh.desktop is missing from the rootfs."
+        exit 1
+    fi
+
+    # Guard against packaging a rootfs tree with corrupted ownership/permissions.
+    # This catches cases where recursive chown operations accidentally touched
+    # system paths like /usr in a reused out/rootfs tree.
+    usr_owner=$(stat -c '%u:%g' "${OUT_DIR}/rootfs/usr" 2>/dev/null || echo "")
+    if [ "${usr_owner}" != "0:0" ]; then
+        echo "[-] Error: ${OUT_DIR}/rootfs/usr is owned by ${usr_owner} (expected 0:0)."
+        echo "    Rootfs ownership appears corrupted."
+        echo "    Rebuild with: RKDEBIAN_FORCE_CLEAN_ROOTFS=1 ./build.sh rootfs"
+        exit 1
+    fi
+
+    if [ ! -e "${OUT_DIR}/rootfs/usr/bin/pkexec" ]; then
+        echo "[-] Error: missing ${OUT_DIR}/rootfs/usr/bin/pkexec."
+        exit 1
+    fi
+    pkexec_owner=$(stat -c '%u:%g' "${OUT_DIR}/rootfs/usr/bin/pkexec" 2>/dev/null || echo "")
+    pkexec_mode=$(stat -c '%a' "${OUT_DIR}/rootfs/usr/bin/pkexec" 2>/dev/null || echo "")
+    if [ "${pkexec_owner}" != "0:0" ] || [ "${pkexec_mode}" != "4755" ]; then
+        echo "[-] Error: ${OUT_DIR}/rootfs/usr/bin/pkexec is ${pkexec_owner} mode ${pkexec_mode}; expected 0:0 mode 4755."
+        echo "    Rootfs ownership/permissions appear corrupted."
+        echo "    Rebuild with: RKDEBIAN_FORCE_CLEAN_ROOTFS=1 ./build.sh rootfs"
+        exit 1
+    fi
+
+    if [ ! -e "${OUT_DIR}/rootfs/usr/lib/polkit-1/polkit-agent-helper-1" ]; then
+        echo "[-] Error: missing ${OUT_DIR}/rootfs/usr/lib/polkit-1/polkit-agent-helper-1."
+        exit 1
+    fi
+    polkit_helper_owner=$(stat -c '%u:%g' "${OUT_DIR}/rootfs/usr/lib/polkit-1/polkit-agent-helper-1" 2>/dev/null || echo "")
+    polkit_helper_mode=$(stat -c '%a' "${OUT_DIR}/rootfs/usr/lib/polkit-1/polkit-agent-helper-1" 2>/dev/null || echo "")
+    if [ "${polkit_helper_owner}" != "0:0" ] || [ "${polkit_helper_mode}" != "4755" ]; then
+        echo "[-] Error: ${OUT_DIR}/rootfs/usr/lib/polkit-1/polkit-agent-helper-1 is ${polkit_helper_owner} mode ${polkit_helper_mode}; expected 0:0 mode 4755."
+        echo "    Rootfs ownership/permissions appear corrupted."
+        echo "    Rebuild with: RKDEBIAN_FORCE_CLEAN_ROOTFS=1 ./build.sh rootfs"
         exit 1
     fi
 }
@@ -270,13 +310,16 @@ setup_dirs() {
             repair_outputs=1
         else
             foreign_output=$(find "${OUT_DIR}" "${OUTPUT_DIR}" -xdev -mindepth 1 \
+                \( -path "${OUT_DIR}/rootfs" -o -path "${OUT_DIR}/rootfs/*" \) -prune -o \
                 \( ! -uid "$(id -u)" -o ! -gid "$(id -g)" \) -print -quit 2>/dev/null || true)
             [ -n "${foreign_output}" ] && repair_outputs=1
         fi
 
         if [ "${repair_outputs}" -eq 1 ]; then
-            echo "[*] Fixing ownership of output directories..."
-            if ! sudo find "${OUT_DIR}" "${OUTPUT_DIR}" -xdev -exec chown -h "$(id -u):$(id -g)" {} +; then
+            echo "[*] Fixing ownership of output directories (excluding rootfs tree)..."
+            if ! sudo find "${OUT_DIR}" "${OUTPUT_DIR}" -xdev \
+                \( -path "${OUT_DIR}/rootfs" -o -path "${OUT_DIR}/rootfs/*" \) -prune -o \
+                -exec chown -h "$(id -u):$(id -g)" {} +; then
                 echo "[-] Error: output directories are not writable and ownership fix failed."
                 echo "    Please run: sudo chown -R $(id -u):$(id -g) ${OUT_DIR} ${OUTPUT_DIR}"
                 exit 1
@@ -750,9 +793,11 @@ case "${CMD}" in
         build_kernel
         ;;
     updateimg)
+        verify_rootfs_profile
         create_image
         ;;
     updatepkg)
+        verify_rootfs_profile
         create_update_package
         ;;
     compile)

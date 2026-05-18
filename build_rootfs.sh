@@ -500,6 +500,22 @@ if [ -e "${ROOTFS_MNT}/usr/bin/su" ]; then
     chroot "${ROOTFS_MNT}" chown root:root /usr/bin/su || true
     chroot "${ROOTFS_MNT}" chmod 4755 /usr/bin/su || true
 fi
+if [ -e "${ROOTFS_MNT}/usr/bin/pkexec" ]; then
+    chroot "${ROOTFS_MNT}" chown root:root /usr/bin/pkexec || true
+    chroot "${ROOTFS_MNT}" chmod 4755 /usr/bin/pkexec || true
+fi
+if [ -e "${ROOTFS_MNT}/usr/lib/polkit-1" ]; then
+    chroot "${ROOTFS_MNT}" chown root:root /usr/lib/polkit-1 || true
+    chroot "${ROOTFS_MNT}" chmod 0755 /usr/lib/polkit-1 || true
+fi
+if [ -e "${ROOTFS_MNT}/usr/lib/polkit-1/polkitd" ]; then
+    chroot "${ROOTFS_MNT}" chown root:root /usr/lib/polkit-1/polkitd || true
+    chroot "${ROOTFS_MNT}" chmod 0755 /usr/lib/polkit-1/polkitd || true
+fi
+if [ -e "${ROOTFS_MNT}/usr/lib/polkit-1/polkit-agent-helper-1" ]; then
+    chroot "${ROOTFS_MNT}" chown root:root /usr/lib/polkit-1/polkit-agent-helper-1 || true
+    chroot "${ROOTFS_MNT}" chmod 4755 /usr/lib/polkit-1/polkit-agent-helper-1 || true
+fi
 # 4. Install Kernel Modules
 if [ -d "${MODULES_DIR}" ]; then
     echo "[*] Installing kernel modules..."
@@ -2278,6 +2294,15 @@ TARGET_USER = os.environ.get("RK_POWERKEY_USER", "chaos")
 SCAN_INTERVAL_SECONDS = 2.0
 TRIGGER_COOLDOWN_SECONDS = 2.0
 MIN_PRESS_SECONDS = float(os.environ.get("RK_POWERKEY_MIN_PRESS_SECONDS", "0.12"))
+POST_RESUME_IGNORE_SECONDS = float(
+    os.environ.get("RK_POWERKEY_POST_RESUME_IGNORE_SECONDS", "4.0")
+)
+RESUME_DETECT_GAP_SECONDS = float(
+    os.environ.get("RK_POWERKEY_RESUME_DETECT_GAP_SECONDS", "1.0")
+)
+POST_SUSPEND_IGNORE_SECONDS = float(
+    os.environ.get("RK_POWERKEY_POST_SUSPEND_IGNORE_SECONDS", "0.75")
+)
 RELEASE_SETTLE_SECONDS = float(
     os.environ.get("RK_POWERKEY_RELEASE_SETTLE_SECONDS", "0.20")
 )
@@ -2289,6 +2314,28 @@ last_device_summary = None
 
 def log(msg):
     print(f"rk-powerkey: {msg}", flush=True)
+
+
+def monotonic_now():
+    return time.monotonic()
+
+
+def boottime_now():
+    clock_boottime = getattr(time, "CLOCK_BOOTTIME", None)
+    if clock_boottime is None:
+        return monotonic_now()
+    try:
+        return time.clock_gettime(clock_boottime)
+    except OSError:
+        return monotonic_now()
+
+
+def detect_resume(last_monotonic, last_boottime):
+    now_monotonic = monotonic_now()
+    now_boottime = boottime_now()
+    suspend_gap = (now_boottime - last_boottime) - (now_monotonic - last_monotonic)
+    resumed = suspend_gap >= RESUME_DETECT_GAP_SECONDS
+    return now_monotonic, now_boottime, resumed, suspend_gap
 
 
 def load_target_user():
@@ -2419,16 +2466,53 @@ def main():
     pending_suspend_at = None
     last_trigger = 0.0
     last_suspend = 0.0
+    ignore_short_until = 0.0
+    last_monotonic = monotonic_now()
+    last_boottime = boottime_now()
 
     while True:
+        now, now_boot, resumed, suspend_gap = detect_resume(last_monotonic, last_boottime)
+        last_monotonic, last_boottime = now, now_boot
+        if resumed:
+            ignore_short_until = max(
+                ignore_short_until, now + POST_RESUME_IGNORE_SECONDS
+            )
+            power_down_at = None
+            power_down_dev = None
+            long_fired = False
+            pending_suspend_at = None
+            log(
+                "resume detected "
+                f"(+{suspend_gap:.2f}s); short-press suspend paused for "
+                f"{POST_RESUME_IGNORE_SECONDS:.1f}s"
+            )
+
         devices = list_power_devices()
         if not devices:
             time.sleep(SCAN_INTERVAL_SECONDS)
             continue
 
         try:
-            next_rescan = time.monotonic() + SCAN_INTERVAL_SECONDS
+            next_rescan = monotonic_now() + SCAN_INTERVAL_SECONDS
             while True:
+                now, now_boot, resumed, suspend_gap = detect_resume(
+                    last_monotonic, last_boottime
+                )
+                last_monotonic, last_boottime = now, now_boot
+                if resumed:
+                    ignore_short_until = max(
+                        ignore_short_until, now + POST_RESUME_IGNORE_SECONDS
+                    )
+                    power_down_at = None
+                    power_down_dev = None
+                    long_fired = False
+                    pending_suspend_at = None
+                    log(
+                        "resume detected "
+                        f"(+{suspend_gap:.2f}s); short-press suspend paused for "
+                        f"{POST_RESUME_IGNORE_SECONDS:.1f}s"
+                    )
+
                 event_seen = False
                 for path, dev in list(devices.items()):
                     try:
@@ -2441,7 +2525,7 @@ def main():
                     if event.type != ecodes.EV_KEY or event.code != ecodes.KEY_POWER:
                         continue
 
-                    now = time.monotonic()
+                    now = monotonic_now()
                     if event.value == 1:
                         # Ignore duplicate key-down repeats from same device.
                         if power_down_at is None:
@@ -2458,18 +2542,25 @@ def main():
                             if long_fired:
                                 log(f"power up after long press ({held:.2f}s)")
                             elif held >= MIN_PRESS_SECONDS:
-                                pending_suspend_at = now + RELEASE_SETTLE_SECONDS
-                                log(
-                                    f"power up after short press ({held:.2f}s), "
-                                    "suspend pending"
-                                )
+                                if now < ignore_short_until:
+                                    remaining = ignore_short_until - now
+                                    log(
+                                        "short press ignored during resume guard "
+                                        f"({remaining:.2f}s left)"
+                                    )
+                                else:
+                                    pending_suspend_at = now + RELEASE_SETTLE_SECONDS
+                                    log(
+                                        f"power up after short press ({held:.2f}s), "
+                                        "suspend pending"
+                                    )
                             else:
                                 log(f"ignored bounce release ({held:.3f}s)")
                         power_down_at = None
                         power_down_dev = None
                         long_fired = False
 
-                now = time.monotonic()
+                now = monotonic_now()
                 if power_down_at is not None and not long_fired:
                     held = now - power_down_at
                     if held >= LONG_PRESS_SECONDS:
@@ -2492,6 +2583,9 @@ def main():
                     if (now - last_suspend) >= SUSPEND_COOLDOWN_SECONDS:
                         trigger_suspend()
                         last_suspend = now
+                        ignore_short_until = max(
+                            ignore_short_until, now + POST_SUSPEND_IGNORE_SECONDS
+                        )
                         log("short press action fired (suspend)")
                     else:
                         log("suspend suppressed by cooldown")
@@ -2501,7 +2595,7 @@ def main():
 
                 # Re-scan periodically so we survive input-node churn.
                 if (
-                    time.monotonic() >= next_rescan
+                    monotonic_now() >= next_rescan
                     and power_down_at is None
                     and pending_suspend_at is None
                 ):
