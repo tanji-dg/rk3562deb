@@ -422,8 +422,8 @@ lock-enabled=true
 disable-lock-screen=false
 PHOSH_LOCK_DCONF
 
-# Let rk-powerkey-longpress service own power-button behavior.
-# GSD default ('suspend') acts on key press; we need release-based handling.
+# Disable GSD power-button actions so logind + custom long-press handler own
+# power-key policy without duplicate actions.
 cat > /etc/dconf/db/local.d/22-rkdebian-power-button << 'PHOSH_POWERKEY_DCONF'
 [org/gnome/settings-daemon/plugins/power]
 power-button-action='nothing'
@@ -3850,16 +3850,35 @@ fix_user_audio() {
     return 0
 }
 
+if [ "${1:-}" = "worker" ]; then
+    log "resume worker action=${2:-unknown} begin"
+    /usr/local/sbin/rk-audio-init.sh >/dev/null 2>&1 || true
+    sleep 1
+    fix_user_audio || true
+    log "resume worker action=${2:-unknown} done"
+    exit 0
+fi
+
 if [ "${1:-}" != "post" ]; then
     exit 0
 fi
 
 case "${2:-}" in
     suspend|hibernate|hybrid-sleep|suspend-then-hibernate|"")
-        log "resume hook action=${2:-unknown} begin"
-        /usr/local/sbin/rk-audio-init.sh >/dev/null 2>&1 || true
-        sleep 1
-        fix_user_audio || true
+        action="${2:-unknown}"
+        log "resume hook action=${action} queued"
+        /usr/bin/systemd-run \
+            --unit="rk-audio-resume-worker-$(date +%s)" \
+            --collect \
+            --quiet \
+            --no-block \
+            --service-type=oneshot \
+            /usr/local/sbin/rk-audio-resume.sh worker "${action}" >/dev/null 2>&1 || {
+                log "resume hook enqueue failed, running inline"
+                /usr/local/sbin/rk-audio-init.sh >/dev/null 2>&1 || true
+                sleep 1
+                fix_user_audio || true
+            }
         ;;
 esac
 
