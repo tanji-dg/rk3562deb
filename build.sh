@@ -3,7 +3,7 @@ set -e
 
 export PATH="/usr/sbin:/sbin:$PATH"
 
-# RK3562 Debian 12 Builder
+# RK3562 Debian 13 Builder
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 SRC_DIR="${ROOT_DIR}/src"
@@ -52,7 +52,7 @@ case "${MAKE_THREADS}" in
 esac
 [ "${MAKE_THREADS}" -lt 1 ] && MAKE_THREADS=1
 
-echo "=== RK3562 Debian 12 Builder ==="
+echo "=== RK3562 Debian 13 Builder ==="
 
 usage() {
     cat <<'EOF'
