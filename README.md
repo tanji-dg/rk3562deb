@@ -1,5 +1,7 @@
 # rkdebian — Debian 12 for Doogee U10 (RK3562)
 
+![Doogee U10 tablet running debian 12](docs/Doogee_U10_debian.jpeg)
+
 ## Download Pre-release Image
 
 > **Current public build (pre-release, May 14, 2026):**
