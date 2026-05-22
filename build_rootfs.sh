@@ -3,7 +3,7 @@ set -e
 
 export PATH="/usr/sbin:/sbin:$PATH"
 
-# RK3562 Debian 13 Trixie Rootfs Builder
+# RK3562 Debian 12 Bookworm Rootfs Builder
 
 if [ "$EUID" -ne 0 ]; then
   echo "[-] This script must be run as root."
@@ -21,8 +21,6 @@ RKDEBIAN_UI_SESSION="${RKDEBIAN_UI_SESSION:-phosh}"
 RKDEBIAN_MALI_GBM_PROVIDER="${RKDEBIAN_MALI_GBM_PROVIDER:-vendor}"
 RKDEBIAN_PREINSTALL_FREETUBE="${RKDEBIAN_PREINSTALL_FREETUBE:-1}"
 RKDEBIAN_MINIMIZE_IMAGE="${RKDEBIAN_MINIMIZE_IMAGE:-0}"
-DEBIAN_SUITE="trixie"
-DEBIAN_MAJOR="13"
 
 case "${RKDEBIAN_DISPLAY_SERVER}" in
     auto|wayland|x11) ;;
@@ -80,7 +78,7 @@ case "${RKDEBIAN_MINIMIZE_IMAGE}" in
         ;;
 esac
 
-echo "[*] Building Debian ${DEBIAN_MAJOR} ${DEBIAN_SUITE^} arm64 rootfs..."
+echo "[*] Building Debian 12 Bookworm arm64 rootfs..."
 echo "[*] UI session: ${RKDEBIAN_UI_SESSION} | GPU stack: ${RKDEBIAN_GPU_STACK} | mali libgbm: ${RKDEBIAN_MALI_GBM_PROVIDER} | preinstall-freetube: ${RKDEBIAN_PREINSTALL_FREETUBE} | minimize: ${RKDEBIAN_MINIMIZE_IMAGE}"
 
 chroot_cleanup() {
@@ -118,27 +116,13 @@ if [ "${RKDEBIAN_FORCE_CLEAN_ROOTFS:-0}" = "1" ]; then
 fi
 
 # 1. Run debootstrap
-rootfs_suite=""
-rootfs_major=""
-if [ -f "${ROOTFS_MNT}/etc/os-release" ]; then
-    rootfs_suite="$(awk -F= '/^VERSION_CODENAME=/{gsub(/"/,"",$2); print $2}' "${ROOTFS_MNT}/etc/os-release" || true)"
-fi
-if [ -f "${ROOTFS_MNT}/etc/debian_version" ]; then
-    rootfs_major="$(cut -d. -f1 < "${ROOTFS_MNT}/etc/debian_version" || true)"
-fi
-
-if [ ! -f "${ROOTFS_MNT}/etc/debian_version" ] || \
-   [ "${rootfs_suite}" != "${DEBIAN_SUITE}" ] || \
-   [ "${rootfs_major}" != "${DEBIAN_MAJOR}" ]; then
-    if [ -f "${ROOTFS_MNT}/etc/debian_version" ]; then
-        echo "[*] Found stale rootfs (${rootfs_suite:-unknown} ${rootfs_major:-unknown}); rebuilding for ${DEBIAN_SUITE}."
-    fi
+if [ ! -f "${ROOTFS_MNT}/etc/debian_version" ]; then
     echo "[*] Cleaning old rootfs..."
     rm -rf "${ROOTFS_MNT}"
     mkdir -p "${ROOTFS_MNT}"
 
     echo "[*] Running debootstrap first stage..."
-    debootstrap --arch=arm64 --foreign "${DEBIAN_SUITE}" "${ROOTFS_MNT}" http://deb.debian.org/debian/
+    debootstrap --arch=arm64 --foreign bookworm "${ROOTFS_MNT}" http://deb.debian.org/debian/
 
     echo "[*] Copying qemu-aarch64-static..."
     cp /usr/bin/qemu-aarch64-static "${ROOTFS_MNT}/usr/bin/"
@@ -147,7 +131,7 @@ if [ ! -f "${ROOTFS_MNT}/etc/debian_version" ] || \
     chmod +x "${ROOTFS_MNT}/debootstrap/debootstrap"
     chroot "${ROOTFS_MNT}" /debootstrap/debootstrap --second-stage
 else
-    echo "[*] Existing Debian ${DEBIAN_MAJOR} (${DEBIAN_SUITE}) rootfs found. Skipping debootstrap..."
+    echo "[*] Existing Debian 12 rootfs found. Skipping debootstrap..."
     echo "[*] Tip: set RKDEBIAN_FORCE_CLEAN_ROOTFS=1 for a fully fresh rebuild."
 fi
 
@@ -177,11 +161,11 @@ cat << 'CHROOT_EOF' > "${ROOTFS_MNT}/tmp/setup_debian.sh"
 set -e
 export DEBIAN_FRONTEND=noninteractive
 
-# Ensure firmware repositories are available on Trixie.
+# Ensure firmware repositories are available on Bookworm.
 cat > /etc/apt/sources.list << 'APT_SOURCES'
-deb http://deb.debian.org/debian trixie main contrib non-free non-free-firmware
-deb http://deb.debian.org/debian trixie-updates main contrib non-free non-free-firmware
-deb http://security.debian.org/debian-security trixie-security main contrib non-free non-free-firmware
+deb http://deb.debian.org/debian bookworm main contrib non-free non-free-firmware
+deb http://deb.debian.org/debian bookworm-updates main contrib non-free non-free-firmware
+deb http://security.debian.org/debian-security bookworm-security main contrib non-free non-free-firmware
 APT_SOURCES
 
 # Avoid man-db trigger permission issues on reused/rootless-compatible trees.
@@ -214,6 +198,13 @@ apt-get install -y sudo curl wget nano vim openssh-server network-manager wpasup
     dolphin plasma-discover okular \
     gstreamer1.0-tools
 
+# Remove any Trixie apt source that may be left over from a previous failed
+# build attempt.  Trixie packages require libc6 >= 2.38 which Bookworm does
+# not have, so mixing the two repos breaks apt.
+rm -f "${ROOTFS_MNT}/etc/apt/sources.list.d/trixie.list"
+rm -f "${ROOTFS_MNT}/etc/apt/preferences.d/99-trixie-pin"
+apt-get update -qq
+
 # Remove stale desktop shells from reused rootfs trees so a non-clean build
 # still converges to the Phosh profile.
 stale_session_pkgs="$(
@@ -243,7 +234,8 @@ fi
 
 # Optional helpers for sandboxed apps and touch/desktop integration.
 for optional_pkg in xdg-desktop-portal-gtk xdg-desktop-portal-gnome plasma-discover-backend-flatpak; do
-    # Check candidate availability in the active suite.
+    # Check exact Bookworm version to avoid accidentally pulling Trixie builds
+    # that sneak in via a dirty apt cache.
     pkg_ver=$(apt-cache policy "${optional_pkg}" 2>/dev/null \
               | awk '/Candidate:/{print $2}')
     if [ -n "${pkg_ver}" ] && [ "${pkg_ver}" != "(none)" ]; then
