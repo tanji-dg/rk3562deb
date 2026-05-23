@@ -170,7 +170,7 @@ APT_SOURCES
 
 # Avoid man-db trigger permission issues on reused/rootless-compatible trees.
 mkdir -p /var/cache/man
-chown -R root:root /var/cache/man 2>/dev/null || true
+chown -R man:man /var/cache/man 2>/dev/null || true
 chmod -R u+rwX /var/cache/man 2>/dev/null || true
 
 # Update apt and install basic utilities
@@ -805,7 +805,7 @@ cd /tmp
 
 # Install build dependencies for VAAPI driver
 mkdir -p /var/cache/man
-chown -R root:root /var/cache/man 2>/dev/null || true
+chown -R man:man /var/cache/man 2>/dev/null || true
 chmod -R u+rwX /var/cache/man 2>/dev/null || true
 
 apt-get install -y --no-install-recommends git build-essential libva-dev libdrm-dev pkg-config
