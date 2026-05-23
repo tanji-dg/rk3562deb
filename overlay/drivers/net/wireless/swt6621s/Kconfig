@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: GPL-2.0
+# Seekwave SWT6621S WiFi+BT driver (vendor lite stack)
+
+source "drivers/net/wireless/swt6621s/seekwaveplatform_lite/Kconfig"
+source "drivers/net/wireless/swt6621s/swt6621s_wifi/Kconfig"
+source "drivers/net/wireless/swt6621s/swtbt4l/Kconfig"
