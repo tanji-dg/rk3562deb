@@ -200,7 +200,8 @@
 	};
 
 	seekwcn_boot: seekwcn_boot {
-		compatible = "seekwave,sv6160";
+		/* swt6621s lite boot driver matches "seekwave,sv6160lite" (CHIP_DEV_NAME) */
+		compatible = "seekwave,sv6160lite";
 		dma_type = <1>;
 		status = "okay";
 		gpio_host_wake = <&gpio0 RK_PB4 GPIO_ACTIVE_LOW>;

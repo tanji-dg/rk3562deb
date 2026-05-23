@@ -535,25 +535,28 @@ build_kernel() {
         scripts/config --disable FTRACE_MCOUNT_RECORD || true
         scripts/config --disable FTRACE_MCOUNT_USE_PATCHABLE_FUNCTION_ENTRY || true
 
-        # Force Seekwave SWT6621S/EA6621 stack and disable legacy Broadcom path.
+        # Force the Seekwave SWT6621S (SV6160-Lite) stack as MODULES and disable
+        # the legacy Broadcom path and the wrong ea6621q Wi-Fi driver.
+        # NOTE: the lite stack MUST be built =m. Built-in (=y) brings the chip up
+        # in early initcalls before the display and black-screens the boot.
         scripts/config --disable BCMDHD || true
         scripts/config --disable AP6XXX || true
         scripts/config --disable WL_ROCKCHIP || true
         scripts/config --disable WIFI_BUILD_MODULE || true
         scripts/config --enable SEEKWAVE_BSP_DRIVERS || true
-        scripts/config --enable SKW_SDIOHAL || true
-        scripts/config --enable SKW_BSP_UCOM || true
-        scripts/config --enable SKW_BSP_BOOT || true
-        scripts/config --enable WLAN_VENDOR_SEEKWAVE || true
-        scripts/config --enable SKW_VENDOR || true
-        scripts/config --enable SKW_DFS_MASTER || true
+        scripts/config --module SKW_SDIOHAL || true
+        scripts/config --module SKW_BSP_UCOM || true
+        scripts/config --module SKW_BSP_BOOT || true
+        # ea6621q Wi-Fi (wrong driver for 1FFE:6621) off; lite Wi-Fi on as module.
+        scripts/config --disable WLAN_VENDOR_SEEKWAVE || true
+        scripts/config --module WLAN_VENDOR_SWT6621S || true
         scripts/config --module SKW_BT || true
         # Enable Rockchip sensor framework before selecting accel drivers.
         scripts/config --enable SENSOR_DEVICE || true
         scripts/config --enable GSENSOR_DEVICE || true
-        scripts/config --enable SKW_LOG_WARN || true
-        scripts/config --disable SKW_LOG_DEBUG || true
-        scripts/config --disable SKW_LOG_DETAIL || true
+        scripts/config --enable SWT6621S_LOG_WARN || true
+        scripts/config --disable SWT6621S_LOG_DEBUG || true
+        scripts/config --disable SWT6621S_LOG_DETAIL || true
         # Build Android-matching accelerometer drivers (SC7A20/DA223).
         scripts/config --enable GS_SC7A20 || true
         scripts/config --enable GS_DA223 || true
