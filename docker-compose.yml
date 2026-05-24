@@ -1,0 +1,35 @@
+services:
+  builder:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile
+    image: rk3562deb-builder
+    # Privileged + binfmt_misc mount are required: the build runs debootstrap
+    # into an arm64 chroot (qemu-user-static), bind-mounts /proc /sys /dev, and
+    # assembles the SD image with genimage.
+    privileged: true
+    working_dir: /build
+    volumes:
+      - ./:/build
+    environment:
+      # Drop generated artifacts back to the invoking host user (set by `make`/CLI).
+      HOST_UID: "${HOST_UID:-0}"
+      HOST_GID: "${HOST_GID:-0}"
+      # Build-tuning passthrough (see README "Environment Variables").
+      RKDEBIAN_UI_SESSION: "${RKDEBIAN_UI_SESSION:-}"
+      RKDEBIAN_GPU_STACK: "${RKDEBIAN_GPU_STACK:-}"
+      RKDEBIAN_DISPLAY_SERVER: "${RKDEBIAN_DISPLAY_SERVER:-}"
+      RKDEBIAN_CPU_GOVERNOR: "${RKDEBIAN_CPU_GOVERNOR:-}"
+      RKDEBIAN_FORCE_CLEAN_ROOTFS: "${RKDEBIAN_FORCE_CLEAN_ROOTFS:-}"
+      RKDEBIAN_PREINSTALL_FREETUBE: "${RKDEBIAN_PREINSTALL_FREETUBE:-}"
+      RKDEBIAN_MINIMIZE_IMAGE: "${RKDEBIAN_MINIMIZE_IMAGE:-}"
+      RKDEBIAN_MAKE_THREADS: "${RKDEBIAN_MAKE_THREADS:-}"
+      RKDEBIAN_KEEP_OVERLAY_PMIC_PATCHES: "${RKDEBIAN_KEEP_OVERLAY_PMIC_PATCHES:-}"
+      RKDEBIAN_MALI_GBM_PROVIDER: "${RKDEBIAN_MALI_GBM_PROVIDER:-}"
+      ROOTFS_IMAGE_SIZE: "${ROOTFS_IMAGE_SIZE:-}"
+      ROOTFS_HEADROOM_MB: "${ROOTFS_HEADROOM_MB:-}"
+      ROOTFS_MIN_MB: "${ROOTFS_MIN_MB:-}"
+    # Override at runtime, e.g.:
+    #   docker compose run --rm builder ./build.sh check
+    #   docker compose run --rm builder ./build.sh all --gpu-stack=panfrost
+    command: ["./build.sh", "all"]
