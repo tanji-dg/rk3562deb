@@ -569,6 +569,11 @@ build_kernel() {
         scripts/config --enable SND_SOC_ROCKCHIP_MULTI_DAIS || true
         scripts/config --enable SND_SOC_ROCKCHIP_PDM_V2 || true
         scripts/config --enable SND_SOC_ROCKCHIP_TRCM || true
+        # USB Ethernet gadget (g_ether) built as a loadable module. USB_ETH
+        # selects USB_U_ETHER/USB_LIBCOMPOSITE, resolved by olddefconfig below.
+        scripts/config --module USB_ETH || true
+        scripts/config --enable USB_ETH_RNDIS || true
+
         # Avoid black screen before userspace by enabling early fb console/logo.
         scripts/config --enable FRAMEBUFFER_CONSOLE || true
         scripts/config --enable LOGO || true
