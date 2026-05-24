@@ -165,6 +165,39 @@ sudo apt-get install \
 
 ## Building
 
+### Build with Docker Compose (no host dependencies)
+
+If you don't want to install the toolchain on your host, build inside a container.
+All dependencies live in `docker/Dockerfile`; only Docker (with the Compose plugin)
+is required on the host.
+
+```bash
+# Build the image once (re-run after changing docker/Dockerfile)
+docker compose build
+
+# Full build — output lands in ./out and ./output on the host
+HOST_UID=$(id -u) HOST_GID=$(id -g) docker compose run --rm builder
+
+# Run a specific target
+HOST_UID=$(id -u) HOST_GID=$(id -g) docker compose run --rm builder ./build.sh check
+HOST_UID=$(id -u) HOST_GID=$(id -g) docker compose run --rm builder ./build.sh image
+
+# Pass build options / environment variables
+RKDEBIAN_FORCE_CLEAN_ROOTFS=1 RKDEBIAN_MINIMIZE_IMAGE=1 \
+  HOST_UID=$(id -u) HOST_GID=$(id -g) \
+  docker compose run --rm builder ./build.sh all --gpu-stack=panfrost
+```
+
+Notes:
+- The container runs **privileged** because the build performs `debootstrap` into
+  an arm64 chroot (via `qemu-user-static` + `binfmt_misc`), bind-mounts
+  `/proc /sys /dev`, and assembles the SD image with `genimage`.
+- The repository is bind-mounted at `/build`, so artifacts (`out/`, `output/`,
+  cloned `src/`) persist on the host. `HOST_UID`/`HOST_GID` hand them back to your
+  user instead of leaving them `root`-owned; omit them to keep `root` ownership.
+- All `RKDEBIAN_*` / `ROOTFS_*` variables documented below are forwarded into the
+  container.
+
 ### Full build (recommended)
 
 Builds U-Boot, kernel, Debian rootfs, and produces a ready-to-flash SD card image:
