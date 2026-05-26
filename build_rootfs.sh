@@ -652,9 +652,9 @@ fi
 if [ -d "${ROOT_DIR}/overlay/firmware" ]; then
     cp -a --no-preserve=ownership "${ROOT_DIR}/overlay/firmware/." "${ROOTFS_MNT}/lib/firmware/" 2>/dev/null || true
 fi
-# Bluetooth NV configuration files
-if [ -d "${ROOT_DIR}/overlay/drivers/net/wireless/ea6621q/swtbt4l/" ]; then
-    cp -f "${ROOT_DIR}/overlay/drivers/net/wireless/ea6621q/swtbt4l/"*.nvbin "${ROOTFS_MNT}/lib/firmware/" 2>/dev/null || true
+# Bluetooth NV configuration files (lite swt6621s stack; sv6160lite.nvbin for SV6160-Lite BT)
+if [ -d "${ROOT_DIR}/overlay/drivers/net/wireless/swt6621s/swtbt4l/" ]; then
+    cp -f "${ROOT_DIR}/overlay/drivers/net/wireless/swt6621s/swtbt4l/"*.nvbin "${ROOTFS_MNT}/lib/firmware/" 2>/dev/null || true
 fi
 
 # BCMDHD default firmware paths (kernel config points to /vendor/etc/firmware)
@@ -672,9 +672,17 @@ if [ -n "${BCM_CLM}" ]; then
     cp -f "${BCM_CLM}" "${ROOTFS_MNT}/vendor/etc/firmware/bcmdhd_clm.blob"
 fi
 
-# Auto-load bluetooth driver module
+# Auto-load the Seekwave SV6160-Lite stack (modules, in dependency order).
+# skw_sdio_lite = BSP/SDIO/boot (must load first); swt6621s_wifi binds programmatically
+# (no DTS node, so it must be force-loaded); skwbt = Bluetooth HCI.
 mkdir -p "${ROOTFS_MNT}/etc/modules-load.d/"
-echo "skwbt" > "${ROOTFS_MNT}/etc/modules-load.d/skwbt.conf"
+# Drop any stale single-module config from earlier ea6621q-era builds.
+rm -f "${ROOTFS_MNT}/etc/modules-load.d/skwbt.conf"
+cat > "${ROOTFS_MNT}/etc/modules-load.d/seekwave.conf" << 'SEEKWAVE_MODS'
+skw_sdio_lite
+swt6621s_wifi
+skwbt
+SEEKWAVE_MODS
 
 # 7. Add Mali GPU udev rules
 echo "[*] Adding Mali GPU udev rules..."
