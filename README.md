@@ -74,6 +74,9 @@ The resulting image is written to an SD card. Insert it and power on — the tab
 | **Gedit** | Text editor |
 | **Pavucontrol** | Audio controls |
 | **Terminal** | `kgx` preferred, `gnome-terminal` fallback |
+| **Byobu (tmux backend)** | Terminal multiplexer; `BYOBU_BACKEND=tmux` pinned for `chaos` |
+| **Docker** | `docker.io` + `docker compose` plugin; `chaos` is in the `docker` group (no sudo needed) |
+| **Claude Code (native CLI)** | `/usr/local/bin/claude`, installed from the official `claude.ai/install.sh` arm64 build |
 | **Flatpak + Flathub** | Enabled by default for app installs |
 
 ## NPU LLM (RK3562)
@@ -276,6 +279,7 @@ These variables can be set before running `build.sh` to control build behaviour:
 | `RKDEBIAN_UI_SESSION` | `phosh` | UI session to auto-login in LightDM. Current supported value: `phosh`. |
 | `RKDEBIAN_GPU_STACK` | `mali` | GPU stack to build for: `mali` (vendor userspace) or `panfrost` (Mesa/Panfrost, no `libmali`). |
 | `RKDEBIAN_CPU_GOVERNOR` | `performance` | Baseline CPU governor used at boot and as the default mapping for Phosh `balanced` mode. |
+| `RKDEBIAN_LANG` | `en_US.UTF-8` | System locale profile baked into the rootfs. `ja_JP.UTF-8` activates a curated Japanese profile (locale, `Asia/Tokyo` timezone, `jp` keyboard, `ibus-mozc` IME, Takao/IPA fonts, AccountsService for `chaos`). Combine with `--force-clean-rootfs` when switching. CLI: `--lang=ja_JP.UTF-8`. |
 | `RKDEBIAN_MALI_GBM_PROVIDER` | `vendor` | Mali-only option: `vendor` keeps `mali/libgbm.so.1` from the blob package (default), `debian` overrides it to Debian `libgbm.so.1` for compatibility testing. |
 | `RKDEBIAN_PREINSTALL_FREETUBE` | `1` | Set to `0` to skip FreeTube preinstall and significantly reduce image size. |
 | `RKDEBIAN_MINIMIZE_IMAGE` | `0` | Set to `1` for aggressive size reduction (prunes non-English locales plus `/usr/share/doc`, `/usr/share/help`, `/usr/share/man`, `/usr/share/info`, and unused Flatpak objects). |

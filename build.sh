@@ -28,6 +28,7 @@ RKDEBIAN_UI_SESSION="${RKDEBIAN_UI_SESSION:-phosh}"
 RKDEBIAN_GPU_STACK="${RKDEBIAN_GPU_STACK:-mali}"
 RKDEBIAN_CPU_GOVERNOR="${RKDEBIAN_CPU_GOVERNOR:-performance}"
 RKDEBIAN_FORCE_CLEAN_ROOTFS="${RKDEBIAN_FORCE_CLEAN_ROOTFS:-0}"
+RKDEBIAN_LANG="${RKDEBIAN_LANG:-en_US.UTF-8}"
 
 CROSS_COMPILE="aarch64-linux-gnu-"
 CPU_THREADS=$(nproc)
@@ -65,6 +66,7 @@ Options:
   --cpu-governor VALUE
   --force-clean-rootfs
   --no-force-clean-rootfs
+  --lang {en_US.UTF-8|ja_JP.UTF-8}
   -h, --help
 EOF
 }
@@ -118,6 +120,15 @@ parse_args() {
                 RKDEBIAN_FORCE_CLEAN_ROOTFS=0
                 shift
                 ;;
+            --lang)
+                [ "$#" -ge 2 ] || { echo "[-] Error: --lang requires a value."; exit 1; }
+                RKDEBIAN_LANG="$2"
+                shift 2
+                ;;
+            --lang=*)
+                RKDEBIAN_LANG="${1#*=}"
+                shift
+                ;;
             -h|--help)
                 usage
                 exit 0
@@ -152,8 +163,9 @@ export RKDEBIAN_UI_SESSION
 export RKDEBIAN_GPU_STACK
 export RKDEBIAN_CPU_GOVERNOR
 export RKDEBIAN_FORCE_CLEAN_ROOTFS
+export RKDEBIAN_LANG
 
-echo "[*] Build profile: session=${RKDEBIAN_UI_SESSION} gpu=${RKDEBIAN_GPU_STACK} display=${RKDEBIAN_DISPLAY_SERVER} clean_rootfs=${RKDEBIAN_FORCE_CLEAN_ROOTFS}"
+echo "[*] Build profile: session=${RKDEBIAN_UI_SESSION} gpu=${RKDEBIAN_GPU_STACK} display=${RKDEBIAN_DISPLAY_SERVER} clean_rootfs=${RKDEBIAN_FORCE_CLEAN_ROOTFS} lang=${RKDEBIAN_LANG}"
 
 case "${RKDEBIAN_DISPLAY_SERVER}" in
     auto|wayland|x11) ;;
@@ -175,6 +187,14 @@ case "${RKDEBIAN_GPU_STACK}" in
     mali|panfrost) ;;
     *)
         echo "[-] Error: unsupported RKDEBIAN_GPU_STACK=${RKDEBIAN_GPU_STACK} (expected mali or panfrost)."
+        exit 1
+        ;;
+esac
+
+case "${RKDEBIAN_LANG}" in
+    en_US.UTF-8|ja_JP.UTF-8) ;;
+    *)
+        echo "[-] Error: unsupported RKDEBIAN_LANG=${RKDEBIAN_LANG} (expected en_US.UTF-8 or ja_JP.UTF-8)."
         exit 1
         ;;
 esac
@@ -376,7 +396,7 @@ sanitize_kbuild_cmd_files() {
 }
 
 run_build_rootfs() {
-    local preserve_env="RKDEBIAN_FORCE_CLEAN_ROOTFS,ROOTFS_IMAGE_SIZE,ROOTFS_HEADROOM_MB,ROOTFS_MIN_MB,RKDEBIAN_DISPLAY_SERVER,RKDEBIAN_GPU_STACK,RKDEBIAN_UI_SESSION,RKDEBIAN_CPU_GOVERNOR,RKDEBIAN_PREINSTALL_FREETUBE,RKDEBIAN_MINIMIZE_IMAGE"
+    local preserve_env="RKDEBIAN_FORCE_CLEAN_ROOTFS,ROOTFS_IMAGE_SIZE,ROOTFS_HEADROOM_MB,ROOTFS_MIN_MB,RKDEBIAN_DISPLAY_SERVER,RKDEBIAN_GPU_STACK,RKDEBIAN_UI_SESSION,RKDEBIAN_CPU_GOVERNOR,RKDEBIAN_PREINSTALL_FREETUBE,RKDEBIAN_MINIMIZE_IMAGE,RKDEBIAN_LANG"
     if [ "${EUID}" -eq 0 ]; then
         bash "${ROOT_DIR}/build_rootfs.sh"
     else

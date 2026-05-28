@@ -27,6 +27,15 @@ RKDEBIAN_UI_SESSION="${RKDEBIAN_UI_SESSION:-phosh}"
 RKDEBIAN_MALI_GBM_PROVIDER="${RKDEBIAN_MALI_GBM_PROVIDER:-vendor}"
 RKDEBIAN_PREINSTALL_FREETUBE="${RKDEBIAN_PREINSTALL_FREETUBE:-1}"
 RKDEBIAN_MINIMIZE_IMAGE="${RKDEBIAN_MINIMIZE_IMAGE:-0}"
+RKDEBIAN_LANG="${RKDEBIAN_LANG:-en_US.UTF-8}"
+
+case "${RKDEBIAN_LANG}" in
+    en_US.UTF-8|ja_JP.UTF-8) ;;
+    *)
+        echo "[-] Unsupported RKDEBIAN_LANG=${RKDEBIAN_LANG} (expected en_US.UTF-8 or ja_JP.UTF-8)."
+        exit 1
+        ;;
+esac
 
 case "${RKDEBIAN_DISPLAY_SERVER}" in
     auto|wayland|x11) ;;
@@ -259,6 +268,36 @@ apt-get install -y lightdm lightdm-gtk-greeter \
     phosh phoc phosh-mobile-settings phosh-mobile-tweaks phosh-plugins \
     squeekboard wlr-randr grim xwayland iio-sensor-proxy
 
+# Always-on local extras: terminal multiplexer + container runtime + tools the
+# claude-code native installer needs (curl, ca-certificates). Split into per-
+# group calls so one missing package (e.g. a renamed compose plugin) doesn't
+# atomic-rollback the others. In Debian trixie the v2 plugin ships as
+# `docker-compose`; older distributions may use `docker-compose-v2`. We try
+# the trixie name first and the legacy alias second.
+echo "[*] Installing extra local packages (byobu, docker, build tools)..."
+apt-get install -y curl ca-certificates || \
+    echo "[!] Warning: curl/ca-certificates install failed; continuing."
+apt-get install -y byobu tmux || \
+    echo "[!] Warning: byobu/tmux install failed; continuing."
+apt-get install -y docker.io containerd uidmap || \
+    echo "[!] Warning: docker.io/containerd install failed; continuing."
+if ! apt-get install -y docker-compose 2>/dev/null; then
+    apt-get install -y docker-compose-v2 2>/dev/null || \
+        echo "[!] Warning: neither docker-compose nor docker-compose-v2 found; skipping."
+fi
+
+# Japanese localization packages (gated on RKDEBIAN_LANG). Lightweight JP-only
+# font set per design: takao + IPA, no full Noto CJK. ibus-mozc supplies the
+# kana->kanji IME wired up later via /etc/environment.d and dconf.
+if [ "${RKDEBIAN_LANG}" = "ja_JP.UTF-8" ]; then
+    echo "[*] Installing Japanese locale packages (ibus-mozc, takao/ipa fonts)..."
+    apt-get install -y \
+        ibus ibus-mozc mozc-data mozc-utils-gui \
+        fonts-takao-gothic fonts-takao-mincho \
+        fonts-ipafont-gothic fonts-ipafont-mincho || \
+        echo "[!] Warning: Japanese package install partially failed; continuing."
+fi
+
 # Prefer a modern terminal app over legacy xterm/uxterm launchers.
 if apt-cache show kgx >/dev/null 2>&1; then
     apt-get install -y kgx
@@ -369,10 +408,46 @@ fi
 find /usr/lib -type f -path '*/NetworkManager/*/libnm-*.so' \
     -exec chown root:root {} + 2>/dev/null || true
     
-# Generate locales
-echo "en_US.UTF-8 UTF-8" > /etc/locale.gen
+# Generate locales. en_US.UTF-8 always kept as a fallback; ja_JP added when
+# RKDEBIAN_LANG selects the Japanese profile.
+if [ "${RKDEBIAN_LANG}" = "ja_JP.UTF-8" ]; then
+    cat > /etc/locale.gen <<'LOCALE_GEN_EOF'
+en_US.UTF-8 UTF-8
+ja_JP.UTF-8 UTF-8
+LOCALE_GEN_EOF
+else
+    echo "en_US.UTF-8 UTF-8" > /etc/locale.gen
+fi
 locale-gen
-update-locale LANG=en_US.UTF-8
+update-locale LANG="${RKDEBIAN_LANG}"
+
+# JP-profile system-wide settings: timezone, keyboard layout, IM bus.
+if [ "${RKDEBIAN_LANG}" = "ja_JP.UTF-8" ]; then
+    echo "[*] Configuring Japanese system defaults (timezone, keyboard, IM)..."
+
+    # Timezone: Asia/Tokyo
+    echo "Asia/Tokyo" > /etc/timezone
+    ln -sf /usr/share/zoneinfo/Asia/Tokyo /etc/localtime
+    dpkg-reconfigure -f noninteractive tzdata >/dev/null 2>&1 || true
+
+    # X11/Wayland keyboard layout (consumed by xkb / Phosh).
+    cat > /etc/default/keyboard <<'KEYBOARD_EOF'
+XKBMODEL="jp106"
+XKBLAYOUT="jp"
+XKBVARIANT=""
+XKBOPTIONS=""
+BACKSPACE="guess"
+KEYBOARD_EOF
+
+    # IM module exports. environment.d is read by systemd user sessions
+    # (Phosh), and /etc/environment by pam_env for shells/login.
+    install -d -m 0755 /etc/environment.d
+    cat > /etc/environment.d/91-rkdebian-im.conf <<'IM_ENVD_EOF'
+GTK_IM_MODULE=ibus
+QT_IM_MODULE=ibus
+XMODIFIERS=@im=ibus
+IM_ENVD_EOF
+fi
 
 # Add default user
 groupadd -f render
@@ -381,6 +456,12 @@ if ! id "chaos" &>/dev/null; then
     echo "chaos:chaos" | chpasswd
 fi
 usermod -aG sudo,video,audio,netdev,render,input chaos
+# Add chaos to the docker group (created by docker.io install) so they can use
+# docker/docker compose without sudo. Tolerate group absence if docker.io
+# install failed earlier.
+if getent group docker >/dev/null 2>&1; then
+    usermod -aG docker chaos
+fi
 install -d -m 0755 /etc/sudoers.d
 cat > /etc/sudoers.d/10-chaos-nopasswd << 'SUDOERS_CHAOS'
 chaos ALL=(ALL) NOPASSWD: ALL
@@ -464,7 +545,24 @@ cat > /etc/dconf/db/local.d/22-rkdebian-power-button << 'PHOSH_POWERKEY_DCONF'
 [org/gnome/settings-daemon/plugins/power]
 power-button-action='nothing'
 PHOSH_POWERKEY_DCONF
+
+# JP profile: pre-seed GNOME/Phosh input sources so first boot already lists
+# Japanese xkb + Mozc IBus engine. Squeekboard reads this key for its layout.
+if [ "${RKDEBIAN_LANG}" = "ja_JP.UTF-8" ]; then
+    cat > /etc/dconf/db/local.d/23-rkdebian-input-sources << 'PHOSH_INPUT_DCONF'
+[org/gnome/desktop/input-sources]
+sources=[('xkb', 'jp'), ('ibus', 'mozc-jp')]
+xkb-options=@as []
+PHOSH_INPUT_DCONF
+fi
+
 dconf update >/dev/null 2>&1 || true
+
+# Rebuild the font cache after package installs so first boot doesn't stall
+# indexing the takao/ipa fonts on the device.
+if [ "${RKDEBIAN_LANG}" = "ja_JP.UTF-8" ]; then
+    fc-cache -fv >/dev/null 2>&1 || true
+fi
 
 # Automatically power adapters when bluetoothd starts.
 if grep -q '^[#[:space:]]*AutoEnable=' /etc/bluetooth/main.conf 2>/dev/null; then
@@ -953,6 +1051,18 @@ sed -i '/^MOZ_DISABLE_RDD_SANDBOX=/d;/^MOZ_X11_EGL=/d;/^MOZ_WEBRENDER=/d' \
     "${ROOTFS_MNT}/etc/environment" || true
 echo "MOZ_DISABLE_RDD_SANDBOX=1" >> "${ROOTFS_MNT}/etc/environment"
 
+# JP profile: also export IM vars via /etc/environment so non-systemd shells
+# pick them up (environment.d alone is not consulted by pam_env).
+if [ "${RKDEBIAN_LANG}" = "ja_JP.UTF-8" ]; then
+    sed -i '/^GTK_IM_MODULE=/d;/^QT_IM_MODULE=/d;/^XMODIFIERS=/d' \
+        "${ROOTFS_MNT}/etc/environment" || true
+    {
+        echo "GTK_IM_MODULE=ibus"
+        echo "QT_IM_MODULE=ibus"
+        echo "XMODIFIERS=@im=ibus"
+    } >> "${ROOTFS_MNT}/etc/environment"
+fi
+
 # Auto-install h264ify on first Firefox run to keep YouTube on H.264 streams.
 mkdir -p "${ROOTFS_MNT}/usr/lib/firefox-esr/distribution"
 cat > "${ROOTFS_MNT}/usr/lib/firefox-esr/distribution/policies.json" << 'FIREFOX_POLICIES'
@@ -1288,6 +1398,8 @@ RKDEBIAN_DISPLAY_SERVER=${RKDEBIAN_DISPLAY_SERVER}
 RKDEBIAN_GPU_STACK=${RKDEBIAN_GPU_STACK}
 RKDEBIAN_CPU_GOVERNOR=${RKDEBIAN_CPU_GOVERNOR}
 RKDEBIAN_FORCE_CLEAN_ROOTFS=${RKDEBIAN_FORCE_CLEAN_ROOTFS:-0}
+RKDEBIAN_LANG=${RKDEBIAN_LANG}
+extra_pkgs=byobu,docker,docker-compose,claude-code-native
 PROFILE_EOF
 
 cat > "${ROOTFS_MNT}/etc/fstab" << 'FSTAB'
@@ -1374,6 +1486,68 @@ rm -f "${ROOTFS_MNT}/etc/systemd/user/graphical-session.target.wants/waybar.serv
 rm -f "${ROOTFS_MNT}/etc/environment.d/90-rkdebian-inputmethod.conf" \
       "${ROOTFS_MNT}/etc/profile.d/90-rkdebian-maliit.sh" \
       "${ROOTFS_MNT}/home/chaos/.config/autostart/maliit-server.desktop"
+
+# JP profile: per-user Phosh/GDM locale + keyboard via AccountsService, plus
+# ibus-daemon autostart for the chaos session.
+if [ "${RKDEBIAN_LANG}" = "ja_JP.UTF-8" ]; then
+    install -d -m 0755 "${ROOTFS_MNT}/var/lib/AccountsService/users"
+    cat > "${ROOTFS_MNT}/var/lib/AccountsService/users/chaos" << 'ACCOUNTS_CHAOS_EOF'
+[User]
+Language=ja_JP.UTF-8
+FormatsLocale=ja_JP.UTF-8
+XSession=phosh
+XKBLayout=jp
+SystemAccount=false
+ACCOUNTS_CHAOS_EOF
+
+    install -d -m 0755 "${ROOTFS_MNT}/home/chaos/.config/autostart"
+    # Idempotent: clear any prior ibus.desktop drop-in before re-creating.
+    rm -f "${ROOTFS_MNT}/home/chaos/.config/autostart/ibus.desktop"
+    cat > "${ROOTFS_MNT}/home/chaos/.config/autostart/ibus.desktop" << 'IBUS_AUTOSTART_EOF'
+[Desktop Entry]
+Type=Application
+Name=IBus
+Exec=ibus-daemon -drx
+OnlyShowIn=GNOME;Phosh;
+X-GNOME-Autostart-enabled=true
+NoDisplay=true
+IBUS_AUTOSTART_EOF
+    chroot "${ROOTFS_MNT}" chown -R chaos:chaos /home/chaos/.config 2>/dev/null || true
+fi
+
+# byobu: pin tmux as the backend (default since byobu 5, but make it explicit
+# so re-runs converge regardless of stale ~/.byobu/backend).
+if [ -d "${ROOTFS_MNT}/usr/share/byobu" ]; then
+    install -d -m 0755 "${ROOTFS_MNT}/home/chaos/.byobu"
+    echo "BYOBU_BACKEND=tmux" > "${ROOTFS_MNT}/home/chaos/.byobu/backend"
+    chroot "${ROOTFS_MNT}" chown -R chaos:chaos /home/chaos/.byobu 2>/dev/null || true
+fi
+
+# Claude Code (native installer). Runs the official installer in an isolated
+# HOME so neither root's nor chaos's dotfiles get touched, then promotes the
+# binary to /usr/local/bin/claude. Failures are tolerated to avoid blocking
+# the whole rootfs build on transient network issues.
+echo "[*] Installing Claude Code (native CLI)..."
+if [ -x "${ROOTFS_MNT}/usr/local/bin/claude" ]; then
+    echo "[*] /usr/local/bin/claude already present; skipping native install."
+else
+    chroot "${ROOTFS_MNT}" /bin/bash -c '
+        set -e
+        export HOME=/tmp/cc-install
+        rm -rf "$HOME"
+        mkdir -p "$HOME"
+        curl -fsSL https://claude.ai/install.sh | bash
+        if [ -x "$HOME/.local/bin/claude" ]; then
+            install -m 0755 "$HOME/.local/bin/claude" /usr/local/bin/claude
+        elif command -v claude >/dev/null 2>&1; then
+            install -m 0755 "$(command -v claude)" /usr/local/bin/claude
+        else
+            echo "[!] claude binary not found after install"
+            exit 1
+        fi
+        rm -rf "$HOME"
+    ' || echo "[!] Warning: claude-code native install failed; continuing."
+fi
 
 # Install Phosh auto-rotation helper (raw accelerometer axis polling).
 # This mirrors the on-device fix:
