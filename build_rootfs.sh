@@ -212,6 +212,7 @@ apt-get install -y sudo curl wget nano vim openssh-server network-manager wpasup
     plymouth plymouth-themes \
     libegl1 libgles2 libgbm1 libva2 libva-drm2 ffmpeg dbus \
     udev evtest pciutils usbutils \
+    iptables nftables iproute2 \
     xinput libinput-tools \
     python3 python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 \
     python3-evdev \

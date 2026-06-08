@@ -594,6 +594,52 @@ build_kernel() {
         scripts/config --module USB_ETH || true
         scripts/config --enable USB_ETH_RNDIS || true
 
+        # TUN/TAP device support (VPN, tailscale, etc.) as a loadable module.
+        scripts/config --module TUN || true
+
+        # Tailscale kernel-mode networking:
+        # - policy routing (ip rule) needs IP(V6)_MULTIPLE_TABLES (bool, =y)
+        # - iptables path needs conntrack/NAT/mangle + mark/comment extensions
+        # - Debian iptables defaults to the nft backend, so enable nf_tables
+        #   with the iptables compat layer as well.
+        # Netfilter pieces are built as MODULES; the kernel auto-loads them
+        # on demand when iptables/nft rules are installed.
+        scripts/config --enable IP_MULTIPLE_TABLES || true
+        scripts/config --enable IPV6_MULTIPLE_TABLES || true
+        scripts/config --module NF_CONNTRACK || true
+        scripts/config --enable NF_CONNTRACK_MARK || true
+        scripts/config --module NF_NAT || true
+        scripts/config --module NETFILTER_XT_CONNMARK || true
+        scripts/config --module NETFILTER_XT_TARGET_CONNMARK || true
+        scripts/config --module NETFILTER_XT_MATCH_CONNMARK || true
+        scripts/config --module NETFILTER_XT_MARK || true
+        scripts/config --module NETFILTER_XT_TARGET_MASQUERADE || true
+        scripts/config --module NETFILTER_XT_MATCH_MARK || true
+        scripts/config --module NETFILTER_XT_MATCH_CONNTRACK || true
+        scripts/config --module NETFILTER_XT_MATCH_COMMENT || true
+        scripts/config --module NETFILTER_XT_MATCH_MULTIPORT || true
+        scripts/config --module NETFILTER_XT_MATCH_ADDRTYPE || true
+        scripts/config --module IP_NF_IPTABLES || true
+        scripts/config --module IP_NF_FILTER || true
+        scripts/config --module IP_NF_NAT || true
+        scripts/config --module IP_NF_TARGET_MASQUERADE || true
+        scripts/config --module IP_NF_MANGLE || true
+        scripts/config --module IP_NF_RAW || true
+        scripts/config --module IP6_NF_IPTABLES || true
+        scripts/config --module IP6_NF_FILTER || true
+        scripts/config --module IP6_NF_NAT || true
+        scripts/config --module IP6_NF_TARGET_MASQUERADE || true
+        scripts/config --module IP6_NF_MANGLE || true
+        scripts/config --module IP6_NF_RAW || true
+        scripts/config --module NF_TABLES || true
+        scripts/config --enable NF_TABLES_INET || true
+        scripts/config --module NFT_COMPAT || true
+        scripts/config --module NFT_NAT || true
+        scripts/config --module NFT_MASQ || true
+        scripts/config --module NFT_CT || true
+        scripts/config --module NFT_LOG || true
+        scripts/config --module NFT_REJECT || true
+
         # Avoid black screen before userspace by enabling early fb console/logo.
         scripts/config --enable FRAMEBUFFER_CONSOLE || true
         scripts/config --enable LOGO || true
