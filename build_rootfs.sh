@@ -213,6 +213,7 @@ apt-get install -y sudo curl wget nano vim openssh-server network-manager wpasup
     libegl1 libgles2 libgbm1 libva2 libva-drm2 ffmpeg dbus \
     udev evtest pciutils usbutils \
     iptables nftables iproute2 \
+    git \
     xinput libinput-tools \
     python3 python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 \
     python3-evdev \
@@ -285,6 +286,43 @@ apt-get install -y docker.io containerd uidmap || \
 if ! apt-get install -y docker-compose 2>/dev/null; then
     apt-get install -y docker-compose-v2 2>/dev/null || \
         echo "[!] Warning: neither docker-compose nor docker-compose-v2 found; skipping."
+fi
+
+# GitHub CLI (gh) is not in the Debian repos; pull it from the official
+# cli.github.com apt repo. Wrapped so a network/key failure does not abort the
+# whole rootfs build (set -e is active in this chroot script).
+echo "[*] Setting up GitHub CLI (gh) apt repo..."
+if (
+    set -e
+    mkdir -p -m 755 /etc/apt/keyrings
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        -o /etc/apt/keyrings/githubcli-archive-keyring.gpg
+    chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list
+    apt-get update
+    apt-get install -y gh
+); then
+    echo "[*] gh installed."
+else
+    echo "[!] Warning: gh install failed; continuing."
+fi
+
+# Tailscale userspace tools from the official trixie apt repo. The kernel TUN
+# and netfilter modules are enabled in build.sh; this adds tailscale/tailscaled.
+echo "[*] Setting up Tailscale apt repo..."
+if (
+    set -e
+    curl -fsSL https://pkgs.tailscale.com/stable/debian/trixie.noarmor.gpg \
+        -o /usr/share/keyrings/tailscale-archive-keyring.gpg
+    curl -fsSL https://pkgs.tailscale.com/stable/debian/trixie.tailscale-keyring.list \
+        -o /etc/apt/sources.list.d/tailscale.list
+    apt-get update
+    apt-get install -y tailscale
+); then
+    echo "[*] tailscale installed."
+else
+    echo "[!] Warning: tailscale install failed; continuing."
 fi
 
 # Japanese localization packages (gated on RKDEBIAN_LANG). Lightweight JP-only
@@ -996,8 +1034,9 @@ if [ ! -f /usr/lib/aarch64-linux-gnu/dri/rockchip_drv_video.so ]; then
     rm -rf /tmp/rk_vaapi_driver /tmp/rk_hw_base
 fi
 
-# Clean up build-only dependencies
-apt-get purge -y git build-essential libva-dev libdrm-dev pkg-config 2>/dev/null || true
+# Clean up build-only dependencies. Keep git: it is a base package in the
+# image (cloned/installed earlier), not a VAAPI build-only dependency.
+apt-get purge -y build-essential libva-dev libdrm-dev pkg-config 2>/dev/null || true
 apt-get autoremove -y 2>/dev/null || true
 
 echo "[+] Rockchip VAAPI driver ready."
@@ -1400,7 +1439,7 @@ RKDEBIAN_GPU_STACK=${RKDEBIAN_GPU_STACK}
 RKDEBIAN_CPU_GOVERNOR=${RKDEBIAN_CPU_GOVERNOR}
 RKDEBIAN_FORCE_CLEAN_ROOTFS=${RKDEBIAN_FORCE_CLEAN_ROOTFS:-0}
 RKDEBIAN_LANG=${RKDEBIAN_LANG}
-extra_pkgs=byobu,docker,docker-compose,claude-code-native
+extra_pkgs=byobu,docker,docker-compose,claude-code-native,git,gh,tailscale
 PROFILE_EOF
 
 cat > "${ROOTFS_MNT}/etc/fstab" << 'FSTAB'
