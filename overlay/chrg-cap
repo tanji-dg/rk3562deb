@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""RK817 CV-voltage charge cap toggle.
+
+Sets the charger constant-voltage (CV) target so the battery naturally tops out
+below 100% SoC, extending calendar life.
+
+Per RK817 datasheet V1.01 §PMIC_CHRG_OUT (0xE4):
+  bit7    POWERPATH_EN  - MUST stay 1; never touched here
+  bit6:4  CHRG_VOL_SEL  - charger CV voltage
+            000=4.10V  001=4.15V  010=4.20V (default)  011=4.25V
+            100=4.30V  101=4.35V  110=4.40V  111=4.45V
+  bit3    CHRG_CT_EN    - preserved
+  bit2:0  CHRG_CUR_SEL  - preserved (kernel default = 2A typ.)
+
+Usage:
+  chrg-cap status     # show current CV voltage
+  chrg-cap on         # cap at 4.10V (~80-85% SoC, long-life mode)
+  chrg-cap off        # restore 4.20V default (full charge)
+  chrg-cap set <mV>   # set explicit voltage (4100..4450 in 50mV steps)
+"""
+import sys
+from smbus2 import SMBus
+
+I2C_BUS = 0
+I2C_ADDR = 0x20
+REG_CHRG_OUT = 0xE4
+MASK_VOL_SEL = 0b01110000  # bit6:4
+
+VOL_TABLE = {
+    0: 4.10, 1: 4.15, 2: 4.20, 3: 4.25,
+    4: 4.30, 5: 4.35, 6: 4.40, 7: 4.45,
+}
+VOL_REV = {round(v * 1000): k for k, v in VOL_TABLE.items()}
+
+CAP_ON_SEL = 0   # 4.10V
+CAP_OFF_SEL = 2  # 4.20V (chip default)
+
+
+def read_reg(bus):
+    return bus.read_byte_data(I2C_ADDR, REG_CHRG_OUT, force=True)
+
+
+def write_sel(bus, sel):
+    if sel not in VOL_TABLE:
+        raise ValueError(f"sel {sel} out of range 0..7")
+    v = read_reg(bus)
+    new = (v & ~MASK_VOL_SEL) | (sel << 4)
+    if new == v:
+        return v, new, False
+    bus.write_byte_data(I2C_ADDR, REG_CHRG_OUT, new, force=True)
+    return v, new, True
+
+
+def cmd_status(bus):
+    v = read_reg(bus)
+    sel = (v >> 4) & 0x7
+    print(f"0xE4 = 0x{v:02x}")
+    print(f"  POWERPATH_EN (bit7) = {(v >> 7) & 1}")
+    print(f"  CHRG_VOL_SEL (bit6:4) = {sel} -> {VOL_TABLE[sel]:.2f}V")
+    print(f"  CHRG_CT_EN   (bit3) = {(v >> 3) & 1}")
+    print(f"  CHRG_CUR_SEL (bit2:0) = {v & 0x7}")
+    print()
+    print(f"cap mode: {'ON (4.10V)' if sel == CAP_ON_SEL else 'OFF (>=4.15V)'}")
+
+
+def cmd_set(bus, sel, label):
+    old, new, changed = write_sel(bus, sel)
+    msg = f"0xE4: 0x{old:02x} -> 0x{new:02x}  CV={VOL_TABLE[sel]:.2f}V  ({label})"
+    print(msg if changed else f"{msg}  (no change)")
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.argv.append("status")
+    cmd = sys.argv[1]
+    bus = SMBus(I2C_BUS)
+    try:
+        if cmd == "status":
+            cmd_status(bus)
+        elif cmd == "on":
+            cmd_set(bus, CAP_ON_SEL, "cap on")
+        elif cmd == "off":
+            cmd_set(bus, CAP_OFF_SEL, "cap off / default")
+        elif cmd == "set":
+            mv = int(sys.argv[2])
+            if mv not in VOL_REV:
+                allowed = ", ".join(f"{v}" for v in sorted(VOL_REV))
+                print(f"error: {mv} mV not allowed. choose from: {allowed}", file=sys.stderr)
+                sys.exit(2)
+            cmd_set(bus, VOL_REV[mv], f"explicit {mv}mV")
+        else:
+            print(__doc__, file=sys.stderr)
+            sys.exit(2)
+    finally:
+        bus.close()
+
+
+if __name__ == "__main__":
+    main()

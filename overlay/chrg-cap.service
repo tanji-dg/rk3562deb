@@ -1,0 +1,11 @@
+[Unit]
+Description=Apply RK817 CV charge cap (4.10V) at boot
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/chrg-cap on
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
