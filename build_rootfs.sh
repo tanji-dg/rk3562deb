@@ -4285,7 +4285,13 @@ if [ -f "${ROOT_DIR}/overlay/usb-mode-switch.sh" ] && [ -f "${ROOT_DIR}/overlay/
     cp "${ROOT_DIR}/overlay/usb-role-manager.service" "${ROOTFS_MNT}/etc/systemd/system/usb-role-manager.service"
     # Clean up deprecated services that caused one-sided behavior.
     chroot "${ROOTFS_MNT}" systemctl disable usb-force-host.service usb-otg-host.service >/dev/null 2>&1 || true
-    chroot "${ROOTFS_MNT}" systemctl enable usb-role-manager.service
+    # The DT now uses the USB role-switch framework (usb-role-switch +
+    # role-switch-default-mode="peripheral" on &usbdrd_dwc3), so the controller
+    # comes up as peripheral and stays there. The polling auto mode of this
+    # script toggled host<->peripheral every 8s, which re-created xhci in a loop
+    # and burned ~44% system time. Keep the script for manual role changes, but
+    # never enable the polling service.
+    chroot "${ROOTFS_MNT}" systemctl disable usb-role-manager.service >/dev/null 2>&1 || true
 fi
 
 # 10b. Front camera ISP setup service (s5k5e8 → rkisp → /dev/video23)

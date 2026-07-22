@@ -934,13 +934,14 @@
 
 &usbdrd_dwc3 {
 	dr_mode = "otg";
+	usb-role-switch;
+	role-switch-default-mode = "peripheral";
 	status = "okay";
 	maximum-speed = "high-speed";
 	phys = <&u2phy_otg>;
 	phy-names = "usb2-phy";
 	snps,dis_u2_susphy_quirk;
 	snps,usb2-lpm-disable;
-	extcon = <&u2phy>;
 };
 
 &video_phy {
