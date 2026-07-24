@@ -590,6 +590,16 @@ IFACES
 
 # Default Phosh WWAN backend away from ModemManager on non-cellular hardware.
 mkdir -p /etc/dconf/db/local.d
+# The keyfiles under local.d only take effect if a dconf profile makes the
+# session read the compiled system-db. The default profile is user-db only, so
+# without this the whole local.d/ tree (lockscreen, power-button, input sources,
+# idle blank) is silently ignored. Layer user over system so user changes still
+# win but our defaults apply out of the box.
+mkdir -p /etc/dconf/profile
+cat > /etc/dconf/profile/user << 'DCONF_PROFILE'
+user-db:user
+system-db:local
+DCONF_PROFILE
 cat > /etc/dconf/db/local.d/20-rkdebian-phosh-wwan << 'PHOSH_WWAN_DCONF'
 [sm/puri/phosh]
 wwan-backend='ofono'
@@ -621,6 +631,15 @@ sources=[('xkb', 'jp'), ('ibus', 'mozc-jp')]
 xkb-options=@as []
 PHOSH_INPUT_DCONF
 fi
+
+# Blank the panel after 5 min of inactivity. gsd-power reads idle-delay; 0 means
+# "never", which is what an older setup left on the device (screen stayed lit
+# forever on mains). Screen-off only -- suspend stays disabled via
+# sleep-inactive-ac-type='nothing' set elsewhere.
+cat > /etc/dconf/db/local.d/24-rkdebian-idle-blank << 'PHOSH_IDLE_DCONF'
+[org/gnome/desktop/session]
+idle-delay=uint32 300
+PHOSH_IDLE_DCONF
 
 dconf update >/dev/null 2>&1 || true
 
