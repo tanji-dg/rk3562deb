@@ -289,6 +289,32 @@ if ! apt-get install -y docker-compose 2>/dev/null; then
         echo "[!] Warning: neither docker-compose nor docker-compose-v2 found; skipping."
 fi
 
+# Compose v2. bookworm only ships the Python v1 (docker-compose 1.29.x) and the
+# apt call above always succeeds with it, so the `docker compose` subcommand
+# would be missing. The kozekachi_ai stack is driven by `docker compose -f a -f b`
+# and needs v2. Install the official static aarch64 binary as a CLI plugin under
+# /usr/local/lib so every user gets it, not just ~/.docker/cli-plugins of one
+# account. Pinned + checksummed; a network failure must not abort the build.
+COMPOSE_V2_VERSION="v2.29.7"
+COMPOSE_V2_SHA256="6e9fbd5daa20dca5d7d89145081ae8155d68ef2928b497d9f85b54fe0f9dbb2c"
+echo "[*] Installing Docker Compose ${COMPOSE_V2_VERSION} CLI plugin..."
+if (
+    set -e
+    mkdir -p /usr/local/lib/docker/cli-plugins
+    curl -fsSL --retry 3 \
+        "https://github.com/docker/compose/releases/download/${COMPOSE_V2_VERSION}/docker-compose-linux-aarch64" \
+        -o /usr/local/lib/docker/cli-plugins/docker-compose.tmp
+    echo "${COMPOSE_V2_SHA256}  /usr/local/lib/docker/cli-plugins/docker-compose.tmp" | sha256sum -c -
+    chmod +x /usr/local/lib/docker/cli-plugins/docker-compose.tmp
+    mv /usr/local/lib/docker/cli-plugins/docker-compose.tmp \
+       /usr/local/lib/docker/cli-plugins/docker-compose
+); then
+    echo "[*] Docker Compose ${COMPOSE_V2_VERSION} installed."
+else
+    rm -f /usr/local/lib/docker/cli-plugins/docker-compose.tmp
+    echo "[!] Warning: Docker Compose v2 install failed; only the v1 'docker-compose' will be available."
+fi
+
 # GitHub CLI (gh) is not in the Debian repos; pull it from the official
 # cli.github.com apt repo. Wrapped so a network/key failure does not abort the
 # whole rootfs build (set -e is active in this chroot script).
